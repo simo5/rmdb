@@ -14,9 +14,11 @@ fn db_filename() -> String {
 fn main() {
     let name = db_filename();
     //println!("Opening {}", name);
-    let x = Rmdb::open(&PathBuf::from(name), true);
-    let _x = match x {
-        Ok(db) => db.close(),
+    let rmdb = Rmdb::open(PathBuf::from(name), true);
+    let mut rmdb = match rmdb {
+        Ok(db) => db,
         Err(error) => panic!("DB error: {:?}", error),
     };
+    rmdb.resize(123456).expect("Resize failed");
+    drop(rmdb);
 }
