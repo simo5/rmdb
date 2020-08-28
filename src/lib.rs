@@ -1,3 +1,4 @@
+use std::convert::TryInto;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -8,12 +9,12 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, RwLock, RwLockReadGuard};
 
 use memmap::MmapMut;
 
 const RMDB_PAGESIZE: u64 = 4096;
-const RMDB_MINSIZE: u64 = RMDB_PAGESIZE * 4;
+const RMDB_MINSIZE: u64 = RMDB_PAGESIZE * 3;
 const RMDB_FILEVER: u32 = 1;
 const RMDB_MAJOR: u16 = 0;
 const RMDB_MINOR: u16 = 0;
@@ -22,6 +23,7 @@ const RMDB_RESERVED: u16 = 0;
 
 #[derive(Debug)]
 pub enum RmdbError {
+    InvalidIndexSize,
     InvalidFileSize,
     InvalidDBFile,
     Io(io::Error),
@@ -33,6 +35,7 @@ impl fmt::Display for RmdbError {
             RmdbError::Io(ref err) => write!(f, "IO error: {}", err),
             RmdbError::InvalidDBFile => write!(f, "Invalid DB file contents"),
             RmdbError::InvalidFileSize => write!(f, "File of invalid size"),
+            RmdbError::InvalidIndexSize => write!(f, "Index too large"),
         }
     }
 }
@@ -43,6 +46,7 @@ impl Error for RmdbError {
             RmdbError::Io(ref err) => Some(err),
             RmdbError::InvalidDBFile => None,
             RmdbError::InvalidFileSize => None,
+            RmdbError::InvalidIndexSize => None,
         }
     }
 }
@@ -156,6 +160,11 @@ fn initialize(mut f: &std::fs::File) -> std::io::Result<()> {
     f.seek(SeekFrom::Start(0))?;
     f.write("RMDB".as_bytes())?;
     f.write(&RMDB_FILEVER.to_le_bytes())?;
+    // set page numbers of first 2 pages
+    f.seek(SeekFrom::Start(RMDB_PAGESIZE))?;
+    f.write(&1u64.to_le_bytes())?;
+    f.seek(SeekFrom::Start(RMDB_PAGESIZE * 2))?;
+    f.write(&2u64.to_le_bytes())?;
     Ok(())
 }
 
@@ -174,4 +183,29 @@ fn initcheck(mut f: &std::fs::File) -> Result<(), RmdbError> {
         return Err(RmdbError::InvalidDBFile)
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct RmdbPage<'a> {
+    db: &'a Rmdb,
+    mmap: RwLockReadGuard<'a, RmdbMmap>,
+    index: u64
+}
+
+impl RmdbPage<'_> {
+    pub fn new<'a>(db: &'a Rmdb, index: u64) -> Result<RmdbPage, RmdbError> {
+        let mmap = db.mmap.read().unwrap();
+        if index >= mmap.num_pages {
+            return Err(RmdbError::InvalidIndexSize)
+        }
+
+        Ok(RmdbPage { db: db, mmap: mmap, index: index })
+    }
+
+    pub fn get_page_num(&self) -> u64 {
+        let start = (self.index * RMDB_PAGESIZE) as usize;
+        let end = start + std::mem::size_of::<u64>();
+        let first_u64 = &self.mmap.mmap[start..end];
+        u64::from_le_bytes(first_u64.try_into().unwrap())
+    }
 }
