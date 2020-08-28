@@ -8,6 +8,7 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::sync::{Mutex, RwLock};
 
 use memmap::MmapMut;
 
@@ -53,11 +54,17 @@ impl From<std::io::Error> for RmdbError {
 }
 
 #[derive(Debug)]
+struct RmdbMmap {
+    mmap: MmapMut,
+    num_pages: u64,
+}
+
+#[derive(Debug)]
 pub struct Rmdb {
     path: PathBuf,
     file: File,
-    mmap: MmapMut,
-    num_pages: u64
+    mmap: RwLock<RmdbMmap>,
+    pointer: Mutex<u64>
 }
 
 impl Rmdb {
@@ -86,29 +93,38 @@ impl Rmdb {
             initcheck(&file)?;
         }
 
+
+
         Ok(
             Rmdb {
                 mmap: unsafe {
-                    MmapMut::map_mut(&file).map_err(RmdbError::Io)?
+                    RwLock::new(
+                        RmdbMmap {
+                            mmap: MmapMut::map_mut(&file).map_err(RmdbError::Io)?,
+                            num_pages: pages,
+                        }
+                    )
                 },
                 path: path,
                 file: file,
-                num_pages: pages,
+                pointer: Mutex::new(0),
             }
         )
     }
 
-    pub fn resize(&mut self, size: u64) -> Result<(), RmdbError> {
+    pub fn resize(&self, size: u64) -> Result<(), RmdbError> {
+        let mut mmap = self.mmap.write().unwrap();
+
         if size < RMDB_MINSIZE {
             return Err(RmdbError::InvalidFileSize)
         }
         let pages = size_to_pages(RMDB_PAGESIZE, size);
-        if pages == self.num_pages {
+        if pages == mmap.num_pages {
             return Ok(())
         }
         self.file.set_len(pages * RMDB_PAGESIZE)?;
         unsafe {
-            Ok(self.mmap = MmapMut::map_mut(&self.file).map_err(RmdbError::Io)?)
+            Ok(mmap.mmap = MmapMut::map_mut(&self.file).map_err(RmdbError::Io)?)
         }
     }
 
@@ -122,7 +138,8 @@ impl Rmdb {
 
 impl Drop for Rmdb {
     fn drop(&mut self) {
-        let err = self.mmap.flush();
+        let mmap = self.mmap.write().unwrap();
+        let err = mmap.mmap.flush();
         let _err = match err {
             Ok(()) => (),
             Err(error) => eprintln!("Failed to fflush mmap: {:?}", error),
