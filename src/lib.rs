@@ -3,13 +3,13 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::path::PathBuf;
 use std::io;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
-use std::sync::{Mutex, RwLock, RwLockReadGuard};
+use std::path::PathBuf;
+use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use memmap::MmapMut;
 
@@ -26,6 +26,7 @@ pub enum RmdbError {
     InvalidIndexSize,
     InvalidFileSize,
     InvalidDBFile,
+    LockError,
     Io(io::Error),
 }
 
@@ -33,6 +34,7 @@ impl fmt::Display for RmdbError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             RmdbError::Io(ref err) => write!(f, "IO error: {}", err),
+            RmdbError::LockError => write!(f, "Lock Poisoned Error"),
             RmdbError::InvalidDBFile => write!(f, "Invalid DB file contents"),
             RmdbError::InvalidFileSize => write!(f, "File of invalid size"),
             RmdbError::InvalidIndexSize => write!(f, "Index too large"),
@@ -44,6 +46,7 @@ impl Error for RmdbError {
     fn cause(&self) -> Option<&dyn Error> {
         match *self {
             RmdbError::Io(ref err) => Some(err),
+            RmdbError::LockError => None,
             RmdbError::InvalidDBFile => None,
             RmdbError::InvalidFileSize => None,
             RmdbError::InvalidIndexSize => None,
@@ -58,7 +61,7 @@ impl From<std::io::Error> for RmdbError {
 }
 
 #[derive(Debug)]
-struct RmdbMmap {
+pub struct RmdbMmap {
     mmap: MmapMut,
     num_pages: u64,
 }
@@ -138,6 +141,22 @@ impl Rmdb {
                (RMDB_RELEASE as u64) << 16 +
                (RMDB_RESERVED as u64)
     }
+
+    pub fn get_reader(&self) -> Result<RwLockReadGuard<'_, RmdbMmap>, RmdbError> {
+        let res = self.mmap.read();
+        match res {
+            Ok(mmap) => Ok(mmap),
+            Err(_er) => Err(RmdbError::LockError)
+        }
+    }
+
+    pub fn get_writer(&self) -> Result<RwLockWriteGuard<'_, RmdbMmap>, RmdbError> {
+        let res = self.mmap.write();
+        match res {
+            Ok(mmap) => Ok(mmap),
+            Err(_er) => Err(RmdbError::LockError)
+        }
+    }
 }
 
 impl Drop for Rmdb {
@@ -187,25 +206,87 @@ fn initcheck(mut f: &std::fs::File) -> Result<(), RmdbError> {
 
 #[derive(Debug)]
 pub struct RmdbPage<'a> {
-    db: &'a Rmdb,
     mmap: RwLockReadGuard<'a, RmdbMmap>,
     index: u64
 }
 
 impl RmdbPage<'_> {
-    pub fn new<'a>(db: &'a Rmdb, index: u64) -> Result<RmdbPage, RmdbError> {
-        let mmap = db.mmap.read().unwrap();
+    pub fn new<'a>(mmap: RwLockReadGuard<'a, RmdbMmap>, index: u64) -> Result<RmdbPage<'a>, RmdbError> {
         if index >= mmap.num_pages {
             return Err(RmdbError::InvalidIndexSize)
         }
 
-        Ok(RmdbPage { db: db, mmap: mmap, index: index })
+        Ok(RmdbPage { mmap: mmap, index: index })
     }
 
-    pub fn get_page_num(&self) -> u64 {
-        let start = (self.index * RMDB_PAGESIZE) as usize;
+    fn get_u64(&self, pos: usize) -> Result<u64, RmdbError> {
+        if pos % std::mem::size_of::<u64>() != 0 {
+            return Err(RmdbError::InvalidIndexSize)
+        }
+        if pos > RMDB_PAGESIZE as usize - std::mem::size_of::<u64>() {
+            return Err(RmdbError::InvalidIndexSize)
+        }
+        let start = (self.index * RMDB_PAGESIZE) as usize + pos;
         let end = start + std::mem::size_of::<u64>();
-        let first_u64 = &self.mmap.mmap[start..end];
-        u64::from_le_bytes(first_u64.try_into().unwrap())
+        let data = &self.mmap.mmap[start..end];
+        Ok(u64::from_le_bytes(data.try_into().unwrap()))
     }
+
+    pub fn get_page_num(&self) -> Result<u64, RmdbError> {
+        self.get_u64(0)
+    }
+}
+
+#[derive(Debug)]
+pub struct RmdbWPage<'a> {
+    mmap: RwLockWriteGuard<'a, RmdbMmap>,
+    index: u64
+}
+
+impl RmdbWPage<'_> {
+    pub fn new<'a>(mmap: RwLockWriteGuard<'a, RmdbMmap>, index: u64) -> Result<RmdbWPage<'a>, RmdbError> {
+        if index >= mmap.num_pages {
+            return Err(RmdbError::InvalidIndexSize)
+        }
+
+        Ok(RmdbWPage { mmap: mmap, index: index })
+    }
+
+    fn set_u64(&mut self, pos: usize, value: u64) -> Result<(), RmdbError> {
+        if pos % std::mem::size_of::<u64>() != 0 {
+            return Err(RmdbError::InvalidIndexSize)
+        }
+        if pos > RMDB_PAGESIZE as usize - std::mem::size_of::<u64>() {
+            return Err(RmdbError::InvalidIndexSize)
+        }
+        let start = (self.index * RMDB_PAGESIZE) as usize + pos;
+        let end = start + std::mem::size_of::<u64>();
+        let data = self.mmap.mmap.get_mut(start..end).unwrap();
+        data.copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    pub fn set_page_num(&mut self, num: u64) -> Result<(), RmdbError> {
+        self.set_u64(0, num)
+    }
+}
+
+impl Drop for RmdbWPage<'_> {
+    fn drop(&mut self) {
+        //TODO: Make flushing optional
+        let (start, end) = page_range(self.index, 0, RMDB_PAGESIZE).unwrap();
+        self.mmap.mmap.flush_async_range(start, end).unwrap();
+    }
+}
+
+fn page_range(index: u64, offset: u64, size: u64) -> Result<(usize, usize),
+                                                            RmdbError> {
+    if offset + size > RMDB_PAGESIZE {
+        return Err(RmdbError::InvalidIndexSize)
+    }
+    let base = index * RMDB_PAGESIZE;
+    Ok((
+        (base + offset) as usize,
+        (base + offset + size) as usize
+    ))
 }
