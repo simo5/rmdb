@@ -4,10 +4,8 @@ use std::fmt;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
-use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -114,8 +112,6 @@ impl Rmdb {
         } else if pos != (pages as usize * RMDB_PAGESIZE) {
             // corrupted, not a multiple of page size
             return Err(RmdbError::InvalidFileSize)
-        } else {
-            initcheck(&file)?;
         }
 
         let mut rmdb = Rmdb {
@@ -134,21 +130,35 @@ impl Rmdb {
         };
 
         if initialize {
-            rmdb.initialize().map_err(RmdbError::Io)?;
+            rmdb.initialize()?;
+        } else {
+            rmdb.integrity_check()?;
         }
 
         Ok(rmdb)
     }
 
-    fn initialize(&mut self) -> std::io::Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write("RMDB".as_bytes())?;
-        self.file.write(&RMDB_FILEVER.to_le_bytes())?;
-        self.file.write(&self.flags.bits().to_le_bytes())?;
+    fn initialize(&mut self) -> Result<(), RmdbError> {
+        let mut page = RmdbWPage::new(self, self.get_writer().unwrap(), 0).unwrap();
+        page.set_buf(0, "RMDB".as_bytes()).unwrap();
+        page.set_buf(4, &RMDB_FILEVER.to_le_bytes()).unwrap();
+        page.set_buf(4, &self.flags.bits().to_le_bytes()).unwrap();
+        drop(page);
         for i in 1..3 {
             let mut page = RmdbWPage::new(self, self.get_writer().unwrap(), i).unwrap();
             page.set_page_num(i).unwrap();
             drop(page)
+        }
+        Ok(())
+    }
+
+    fn integrity_check(&mut self) -> Result<(), RmdbError> {
+        let mut page = RmdbPage::new(self, self.get_reader().unwrap(), 0).unwrap();
+        if page.get_buf(0, 4).unwrap() != "RMDB".as_bytes() {
+            return Err(RmdbError::IntegrityCheck)
+        }
+        if page.get_buf(4, 8).unwrap() != &RMDB_FILEVER.to_le_bytes() {
+            return Err(RmdbError::IntegrityCheck)
         }
         Ok(())
     }
@@ -213,23 +223,6 @@ fn size_to_pages(page_size: usize, size: usize) -> u64 {
     return ((size + page_size - 1) / page_size) as u64;
 }
 
-fn initcheck(mut f: &std::fs::File) -> Result<(), RmdbError> {
-    f.seek(SeekFrom::Start(0)).map_err(RmdbError::Io)?;
-
-    let mut sig = [0; 8];
-    let n = f.read(&mut sig).map_err(RmdbError::Io)?;
-    if n != 8 {
-        return Err(RmdbError::InvalidDBFile)
-    }
-    if b"RMDB" != &sig[0..4] {
-        return Err(RmdbError::InvalidDBFile)
-    }
-    if &RMDB_FILEVER.to_le_bytes() != &sig[4..8] {
-        return Err(RmdbError::InvalidDBFile)
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
 pub struct RmdbPage<'a> {
     db: &'a Rmdb,
@@ -265,6 +258,11 @@ impl RmdbPage<'_> {
                                       std::mem::size_of::<u64>()).unwrap();
         let data = &self.mmap.mmap[start..end];
         Ok(u64::from_le_bytes(data.try_into().unwrap()))
+    }
+
+    fn get_buf(&mut self, pos: usize, size: usize) -> Result<&[u8], RmdbError> {
+        let (start, end) = page_range(self.index, pos, size).unwrap();
+        Ok(self.mmap.mmap.get(start..end).unwrap())
     }
 
     pub fn get_page_num(&self) -> Result<u64, RmdbError> {
