@@ -153,15 +153,19 @@ impl Rmdb {
         Ok(())
     }
 
-    pub fn resize(&self, size: usize) -> Result<(), RmdbError> {
-        let mut mmap = self.mmap.write().unwrap();
+    pub fn resize(&self, pages: u64) -> Result<(), RmdbError> {
+        let size = pages as usize * RMDB_PAGESIZE;
 
         if size < RMDB_MINSIZE {
             return Err(RmdbError::InvalidFileSize)
         }
-        let pages = size_to_pages(RMDB_PAGESIZE, size);
+
+        let mut mmap = self.mmap.write().unwrap();
         if pages == mmap.num_pages {
             return Ok(())
+        }
+        if pages < mmap.num_pages {
+            return Err(RmdbError::InvalidFileSize)
         }
         mmap.num_pages = pages;
         self.file.set_len(pages * RMDB_PAGESIZE as u64)?;

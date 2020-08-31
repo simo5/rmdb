@@ -16,7 +16,7 @@ fn db_filename(sname: &str) -> String {
 }
 
 fn dev_tests(rmdb: &Arc<Rmdb>) {
-    rmdb.resize(123456).expect("Resize failed");
+    rmdb.resize(10).expect("Resize failed");
 
     let page_1 = RmdbPage::new(&rmdb, rmdb.get_reader().unwrap(), 1).unwrap();
     println!("Page 1 value: {}", page_1.get_page_num().unwrap());
