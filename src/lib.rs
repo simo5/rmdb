@@ -69,6 +69,16 @@ bitflags! {
     pub struct RmdbFlags: u32 {
         const PAGE_INTEGRITY = 1;
         const PAGE_ENCRYPTION = 2;
+        const PAGE_FLUSH = 4;
+        const PAGE_SYNC_FLUSH = 8;
+        const TRANSACTION_FLUSH = 16;
+        const TRANSACTION_SYNC_FLUSH = 32;
+    }
+}
+
+impl Default for RmdbFlags {
+    fn default() -> RmdbFlags {
+        RmdbFlags::PAGE_FLUSH | RmdbFlags::TRANSACTION_SYNC_FLUSH
     }
 }
 
@@ -128,6 +138,10 @@ impl Rmdb {
             flags: flags,
             pointer: Mutex::new(0),
         };
+
+        if rmdb.flags.is_empty() {
+            rmdb.flags = Default::default()
+        }
 
         if initialize {
             rmdb.initialize()?;
@@ -334,14 +348,21 @@ impl RmdbWPage<'_> {
         let hash = compute_hash(data);
         self.set_buf(RMDB_PAGESIZE - 32, &hash).unwrap();
     }
+
+    fn page_flush(&mut self) {
+        let (start, end) = page_range(self.index, 0, RMDB_PAGESIZE).unwrap();
+        if self.db.flags.contains(RmdbFlags::PAGE_SYNC_FLUSH) {
+            self.mmap.mmap.flush_range(start, end).unwrap();
+        } else if self.db.flags.contains(RmdbFlags::PAGE_FLUSH) {
+            self.mmap.mmap.flush_async_range(start, end).unwrap();
+        }
+    }
 }
 
 impl Drop for RmdbWPage<'_> {
     fn drop(&mut self) {
         self.integrity_protect();
-        //TODO: Make flushing optional
-        let (start, end) = page_range(self.index, 0, RMDB_PAGESIZE).unwrap();
-        self.mmap.mmap.flush_async_range(start, end).unwrap();
+        self.page_flush();
     }
 }
 

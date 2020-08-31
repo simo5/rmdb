@@ -42,10 +42,8 @@ fn dev_tests(rmdb: &Arc<Rmdb>) {
 
 fn main() {
     let name = db_filename("test1db.rmdb");
-    let rmdb = Arc::new(Rmdb::open(PathBuf::from(name),
-                                   RmdbFlags::PAGE_INTEGRITY,
-                                   true)
-                        .unwrap());
+    let flags = <RmdbFlags as Default>::default() | RmdbFlags::PAGE_INTEGRITY;
+    let rmdb = Arc::new(Rmdb::open(PathBuf::from(name), flags, true).unwrap());
 
     dev_tests(&rmdb);
 
