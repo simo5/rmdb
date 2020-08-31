@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmdb::Rmdb;
+use rmdb::RmdbFlags;
 use rmdb::RmdbPage;
 use rmdb::RmdbWPage;
 
@@ -17,22 +18,22 @@ fn db_filename(sname: &str) -> String {
 fn dev_tests(rmdb: &Arc<Rmdb>) {
     rmdb.resize(123456).expect("Resize failed");
 
-    let page_1 = RmdbPage::new(rmdb.get_reader().unwrap(), 1).unwrap();
+    let page_1 = RmdbPage::new(&rmdb, rmdb.get_reader().unwrap(), 1).unwrap();
     println!("Page 1 value: {}", page_1.get_page_num().unwrap());
     drop(page_1);
 
-    let page_2 = RmdbPage::new(rmdb.get_reader().unwrap(), 2).unwrap();
+    let page_2 = RmdbPage::new(&rmdb, rmdb.get_reader().unwrap(), 2).unwrap();
     println!("Page 2 value: {}", page_2.get_page_num().unwrap());
     drop(page_2);
 
-    let mut page_3 = RmdbWPage::new(rmdb.get_writer().unwrap(), 3).unwrap();
+    let mut page_3 = RmdbWPage::new(&rmdb, rmdb.get_writer().unwrap(), 3).unwrap();
     page_3.set_page_num(3).unwrap();
     drop(page_3);
 
-    let page_3_r = RmdbPage::new(rmdb.get_reader().unwrap(), 3).unwrap();
+    let page_3_r = RmdbPage::new(&rmdb, rmdb.get_reader().unwrap(), 3).unwrap();
     println!("Page 3 value: {}", page_3_r.get_page_num().unwrap());
 
-    let page_blows = RmdbPage::new(rmdb.get_reader().unwrap(), 2000);
+    let page_blows = RmdbPage::new(&rmdb, rmdb.get_reader().unwrap(), 2000);
     match page_blows {
         Ok(_page) => panic!("Got page but should have failed!"),
         Err(_err) => return
@@ -41,7 +42,10 @@ fn dev_tests(rmdb: &Arc<Rmdb>) {
 
 fn main() {
     let name = db_filename("test1db.rmdb");
-    let rmdb = Arc::new(Rmdb::open(PathBuf::from(name), true).unwrap());
+    let rmdb = Arc::new(Rmdb::open(PathBuf::from(name),
+                                   RmdbFlags::PAGE_INTEGRITY,
+                                   true)
+                        .unwrap());
 
     dev_tests(&rmdb);
 
