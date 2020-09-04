@@ -1,5 +1,7 @@
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
 
 use rmdb::Rmdb;
 use rmdb::RmdbFlags;
@@ -14,7 +16,7 @@ fn db_filename(sname: &str) -> String {
     String::from(sname)
 }
 
-fn dev_tests(rmdb: &mut rmdb::Rmdb) {
+fn dev_tests_1(rmdb: &mut rmdb::Rmdb) {
     rmdb.resize(10).expect("Resize failed");
 
     let mut db = rmdb.db.write().unwrap();
@@ -45,7 +47,45 @@ fn main() {
     let flags = <RmdbFlags as Default>::default() | RmdbFlags::PAGE_INTEGRITY;
     let mut rmdb = Rmdb::open(PathBuf::from(name), flags, true).unwrap();
 
-    dev_tests(&mut rmdb);
+    dev_tests_1(&mut rmdb);
 
     drop(rmdb);
+
+    let name = db_filename("test1db.rmdb");
+    let rmdb = Arc::new(Rmdb::open(PathBuf::from(name), flags, true).unwrap());
+    let mut handles = vec![];
+
+    for t in 0..10 {
+        let rmdb = Arc::clone(&rmdb);
+        let handle = thread::spawn(move || {
+            let db = rmdb.db.read().unwrap();
+            let page = RmdbPage::new(&*db, rmdb.flags(), 1).unwrap();
+            println!("Page 1 value from {:?}({}): {}",
+                     thread::current().name(), t, page.get_page_num().unwrap());
+            drop(page);
+            drop(db);
+            let mut db = rmdb.db.write().unwrap();
+            let mut page = RmdbWPage::new(&mut *db, rmdb.flags(), 1).unwrap();
+            page.set_page_num(t).unwrap();
+            drop(page);
+            let page = RmdbPage::new(&*db, rmdb.flags(), 1).unwrap();
+            println!("Page 1 value from {:?}({})[after]: {}",
+                     thread::current().name(), t, page.get_page_num().unwrap());
+            drop(page);
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let mut db = rmdb.db.write().unwrap();
+    let page = RmdbPage::new(&*db, rmdb.flags(), 1).unwrap();
+    println!("Page 1 value: {}", page.get_page_num().unwrap());
+    drop(page);
+    /* Reset to leave db consistent */
+    let mut page = RmdbWPage::new(&mut *db, rmdb.flags(), 1).unwrap();
+    page.set_page_num(1).unwrap();
+    drop(page);
 }
