@@ -437,49 +437,51 @@ impl Rmdb {
     }
 
     fn initialize(&mut self) -> Result<(), RmdbError> {
-        let flags = self.flags;
-        let mut page = self.get_write_page(0).unwrap();
-        page.set_buf(RMDB_P_SIG, "RMDB".as_bytes())?;
-        page.set_buf(RMDB_P_VER, &RMDB_FILEVER.to_le_bytes())?;
-        page.set_buf(RMDB_P_FLAGS, &flags.bits().to_le_bytes())?;
-        page.set_u64(RMDB_P_RMAIN, 1)?;
-        page.set_u64(RMDB_P_WMAIN, 2)?;
-        drop(page);
+        let mut wmap = self.wmap.lock().unwrap();
+        let page = page_get_payload!(mut, self, wmap, 0);
+        pagebuf_set_buf!(page, RMDB_P_SIG, "RMDB".as_bytes());
+        pagebuf_set_buf!(page, RMDB_P_VER, &RMDB_FILEVER.to_le_bytes());
+        pagebuf_set_buf!(page, RMDB_P_FLAGS, &self.flags.bits().to_le_bytes());
+        pagebuf_set_int!(u64, page, RMDB_P_RMAIN, 1u64);
+        pagebuf_set_int!(u64, page, RMDB_P_WMAIN, 2u64);
+        integrity_protect(&mut wmap, self.flags, 0)?;
         let pagesize = page_size(self.flags());
         for i in 1..3 {
-            let mut page = self.get_write_page(i).unwrap();
+            let page = page_get_payload!(mut, self, wmap, i);
             let freepagessize = pagesize - (PAGEPTR_SIZE * 2) - MAIN_FREEPAGES;
             let mut freepages = vec![u8::MAX; freepagessize];
             /* First three pages are always taken */
             freepages[0] = freepages[0] >> 3;
-            page.set_buf(MAIN_FREEPAGES, &freepages)?;
+            pagebuf_set_buf!(page, MAIN_FREEPAGES, &freepages);
             /* Initial db has only one free page buf */
-            page.set_u64(MAIN_FREEPAGES + freepagessize, 0)?;
+            pagebuf_set_int!(u64, page, MAIN_FREEPAGES + freepagessize, 0u64);
             /* and points to no root node page */
-            page.set_u64(pagesize - 8, 0)?;
+            pagebuf_set_int!(u64, page, pagesize - 8, 0u64);
             /* mark page type */
-            page.set_u32(POS_PAGETYPE, PAGE_MAIN | PAGE_DIRTY)?;
-            drop(page)
+            pagebuf_set_int!(u32, page, POS_PAGETYPE, PAGE_MAIN | PAGE_DIRTY);
+            integrity_protect(&mut wmap, self.flags, 1)?;
         }
         Ok(())
     }
 
     fn integrity_check(&self) -> Result<(), RmdbError> {
-        let page = self.get_read_page(0).unwrap();
-        if page.get_buf(RMDB_P_SIG, 4).unwrap() != "RMDB".as_bytes() {
-            return Err(RmdbError::IntegrityCheck)
-        }
-        if page.get_buf(RMDB_P_VER, 4).unwrap() != &RMDB_FILEVER.to_le_bytes() {
-            return Err(RmdbError::IntegrityCheck)
-        }
-
-        /* check read and write main pages */
 
         /* block writers */
         let _wmap = self.wmap.lock().unwrap();
         let select = self.select.lock().unwrap();
         let rmap = self.rmap.read().unwrap();
 
+        /* check page 0 */
+        let sig = page_get_buf!(rmap, 0, RMDB_P_SIG, 4);
+        if sig != "RMDB".as_bytes() {
+            return Err(RmdbError::IntegrityCheck)
+        }
+        let ver = page_get_buf!(rmap, 0, RMDB_P_VER, 4);
+        if ver != &RMDB_FILEVER.to_le_bytes() {
+            return Err(RmdbError::IntegrityCheck)
+        }
+
+        /* check read and write main pages */
         let page = page_get_payload!(self, rmap, select.readpage);
         let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
         if ptype & PAGE_MAIN == 0 {
@@ -496,22 +498,6 @@ impl Rmdb {
     }
 
     fn setup(&mut self) -> Result<(), RmdbError> {
-        let page = self.get_read_page(0).unwrap();
-        let flags_buf = page.get_buf(RMDB_P_FLAGS, 4).unwrap().try_into().unwrap();
-        let rmain = page.get_u64(RMDB_P_RMAIN).unwrap();
-        let wmain = page.get_u64(RMDB_P_WMAIN).unwrap();
-        drop(page);
-
-        /* set flags compatibily with what's in the DB */
-        let dbflags = RmdbFlags::from_bits(u32::from_le_bytes(flags_buf)).unwrap();
-
-        if dbflags.contains(RmdbFlags::PAGE_INTEGRITY) {
-            self.flags |= RmdbFlags::PAGE_INTEGRITY;
-        } else {
-            self.flags |= !RmdbFlags::PAGE_INTEGRITY;
-        }
-        self.pagesize = page_size(self.flags);
-
         /* Set current root pages */
 
         /* block writers */
@@ -522,6 +508,21 @@ impl Rmdb {
 
         /* wait until all readers are done */
         let rmap = self.rmap.write().unwrap();
+
+        let flags_buf = page_get_buf!(rmap, 0, RMDB_P_FLAGS, 4);
+        let rmain = page_get_int!(u64, rmap, 0, RMDB_P_RMAIN);
+        let wmain = page_get_int!(u64, rmap, 0, RMDB_P_WMAIN);
+
+        /* set flags compatibily with what's in the DB */
+        let dbflags = RmdbFlags::from_bits(
+                u32::from_le_bytes(flags_buf.try_into().unwrap())).unwrap();
+
+        if dbflags.contains(RmdbFlags::PAGE_INTEGRITY) {
+            self.flags |= RmdbFlags::PAGE_INTEGRITY;
+        } else {
+            self.flags |= !RmdbFlags::PAGE_INTEGRITY;
+        }
+        self.pagesize = page_size(self.flags);
 
         select.writepage = wmain;
         select.readpage = rmain;
@@ -578,43 +579,6 @@ impl Rmdb {
         return self.flags;
     }
 
-    pub fn get_read_page<'a>(&'a self, page: u64) -> Result<RmdbPage<'a>, RmdbError> {
-        let select = self.select.lock().unwrap();
-        let readpage = select.readpage;
-        let rmap = self.rmap.read().unwrap();
-        drop(select);
-        if page >= self.num_pages {
-            return Err(RmdbError::InvalidIndexSize)
-        }
-        page_integrity_check(&*rmap, self.flags, page)?;
-
-        Ok(RmdbPage {
-            rmap: rmap,
-            _flags: self.flags,
-            _readpage: readpage,
-            page: page,
-        })
-    }
-
-    pub fn get_write_page<'a>(&'a self, page: u64) -> Result<RmdbWPage<'a>, RmdbError> {
-        let select = self.select.lock().unwrap();
-        let writepage = select.writepage;
-        let readpage = select.readpage;
-        let wmap = self.wmap.lock().unwrap();
-        drop(select);
-        if page >= self.num_pages {
-            return Err(RmdbError::InvalidIndexSize)
-        }
-        Ok(RmdbWPage {
-            wmap: wmap,
-            flags: self.flags,
-            _writepage: writepage,
-            _readpage: readpage,
-            page: page,
-            pagesize: self.pagesize,
-        })
-    }
-
     pub fn get_read_transaction<'a>(&'a self) -> Result<RmdbTxn<'a>, RmdbError> {
         let select = self.select.lock().unwrap();
         let readpage = select.readpage;
@@ -630,7 +594,8 @@ impl Rmdb {
         })
     }
 
-    pub fn get_write_transaction<'a>(&'a self) -> Result<RmdbWTxn<'a>, RmdbError> {
+    pub fn get_write_transaction<'a>(&'a self)
+            -> Result<RmdbWTxn<'a>, RmdbError> {
         let wmap = self.wmap.lock().unwrap();
         let select = self.select.lock().unwrap();
         let writepage = select.writepage;
@@ -647,10 +612,8 @@ impl Rmdb {
             dirtypages: Vec::new(),
         };
 
-        let page = self.get_read_page(0)?;
-        let pagesize = page_size(self.flags);
-        let data = page.get_buf(0, pagesize)?;
-        txn.mainpage[0..pagesize].clone_from_slice(data);
+        txn.mainpage[0..RMDB_PAGESIZE]
+            .clone_from_slice(&txn.wmap[0..RMDB_PAGESIZE]);
 
         Ok(txn)
     }
@@ -678,21 +641,6 @@ pub fn page_size(flags: RmdbFlags) -> usize {
     return size;
 }
 
-fn page_integrity_check(mmap: &Mmap, flags: RmdbFlags, page: u64)
-                                                    -> Result<(), RmdbError> {
-    if !flags.contains(RmdbFlags::PAGE_INTEGRITY) {
-        return Ok(())
-    }
-    let (start, end) = page_range(page, 0, RMDB_PAGESIZE - 32).unwrap();
-    let data = mmap.get(start..end).unwrap();
-    let hash = compute_hash(data);
-    let verify = mmap.get(end..(end+32)).unwrap();
-    if verify != hash {
-        return Err(RmdbError::IntegrityCheck)
-    }
-    Ok(())
-}
-
 fn integrity_protect(mmap: &mut MmapMut, flags: RmdbFlags, page: u64)
                                                 -> Result<(), RmdbError> {
     if flags.contains(RmdbFlags::PAGE_INTEGRITY) {
@@ -712,73 +660,6 @@ fn page_flush(mmap: &mut MmapMut, flags: RmdbFlags, page: u64)
         mmap.flush_async_range(start, end).unwrap();
     }
     Ok(())
-}
-
-pub struct RmdbPage<'a> {
-    rmap: RwLockReadGuard<'a, Mmap>,
-    _flags: RmdbFlags,
-    _readpage: u64,
-    page: u64,
-}
-
-impl RmdbPage<'_> {
-    pub fn get_u64(&self, pos: usize) -> Result<u64, RmdbError> {
-        Ok(page_get_int!(u64, &*self.rmap, self.page, pos))
-    }
-
-    pub fn get_buf<'a>(&'a self, pos: usize, size: usize)
-                                            -> Result<&'a [u8], RmdbError> {
-        Ok(page_get_buf!(&*self.rmap, self.page, pos, size))
-    }
-}
-
-pub struct RmdbWPage<'a> {
-    wmap: MutexGuard<'a, MmapMut>,
-    flags: RmdbFlags,
-    _writepage: u64,
-    _readpage: u64,
-    page: u64,
-    pagesize: usize,
-}
-
-impl RmdbWPage<'_> {
-    pub fn set_u64(&mut self, pos: usize, value: u64)
-                                                -> Result<(), RmdbError> {
-        if pos % std::mem::size_of::<u64>() != 0 {
-            /* enforce alignment */
-            return Err(RmdbError::UnalignedAccess)
-        }
-        let mut buf = page_get_buf!(mut, self.wmap, self.page,
-                                    pos, std::mem::size_of::<u64>());
-        pagebuf_set_int!(u64, &mut buf, 0, value);
-        Ok(())
-    }
-
-    pub fn set_u32(&mut self, pos: usize, value: u32)
-                                                -> Result<(), RmdbError> {
-        if pos % std::mem::size_of::<u32>() != 0 {
-            /* enforce alignment */
-            return Err(RmdbError::UnalignedAccess)
-        }
-        let mut buf = page_get_buf!(mut, self.wmap, self.page,
-                                    pos, std::mem::size_of::<u32>());
-        pagebuf_set_int!(u32, &mut buf, 0, value);
-        Ok(())
-    }
-
-    pub fn set_buf(&mut self, pos: usize, buf: &[u8])
-                                                -> Result<(), RmdbError> {
-        let mut page = page_get_payload!(mut, self, self.wmap, self.page);
-        pagebuf_set_buf!(&mut page, pos, buf);
-        Ok(())
-    }
-}
-
-impl Drop for RmdbWPage<'_> {
-    fn drop(&mut self) {
-        integrity_protect(&mut *self.wmap, self.flags, self.page).unwrap();
-        page_flush(&mut *self.wmap, self.flags, self.page).unwrap();
-    }
 }
 
 fn page_range(index: u64, offset: usize, size: usize)
