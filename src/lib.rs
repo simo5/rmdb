@@ -7,7 +7,7 @@ use std::io;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use memmap::{Mmap, MmapMut};
 use openssl::sha;
@@ -40,14 +40,23 @@ const RMDB_INTGSIZE: usize = 32;
  *   |--------------------------------
  *   . OPIONAL INTEGRITY/ENCRYPTION  .
  *   .................................
- *
- * Page number 1 and 2 are the two main pages,
+ */
+const RMDB_P_SIG: usize = 0;
+const RMDB_P_VER: usize = 4;
+const RMDB_P_FLAGS: usize = 8;
+//const RMDB_P_RESERVED: usize = 12;
+const RMDB_P_RMAIN: usize = 16;
+const RMDB_P_WMAIN: usize = 24;
+
+/* Page number 1 and 2 (at initialization) are the two main pages,
  * The page pointed by the zeroth page index is the readers page,
  * The other is the main page used by the writer.
  *
  * The main pages have this structure:
  *   0              32              64
  *   ---------------------------------
+ * 0 |   PAGETYPE   |   RESERVED     |
+ *   |-------------------------------|
  *   |   FREE PAGES: each bit is a   |
  *   |   free page (from page 0)     |
  *   .   ...                         .
@@ -60,15 +69,106 @@ const RMDB_INTGSIZE: usize = 32;
  *   . OPIONAL INTEGRITY/ENCRYPTION  .
  *   .................................
  */
-const RMDB_P_SIG: usize = 0;
-const RMDB_P_VER: usize = 4;
-const RMDB_P_FLAGS: usize = 8;
-//const RMDB_P_RESERVED: usize = 12;
-const RMDB_P_RMAIN: usize = 16;
-const RMDB_P_WMAIN: usize = 24;
+
+const POS_PAGETYPE: usize = 0;
+const MAIN_FREEPAGES: usize = 8;
+
+const PAGE_MAIN: u32 = 1u32 << 0;
+const PAGE_NODE: u32 = 1u32 << 1;
+const PAGE_LEAF: u32 = 1u32 << 2;
+const PAGE_DIRTY: u32 = 1u32 << 31;
+
+/* Pages are of two types: node or leaf.
+ * Node page structure:
+ *   0              32              64
+ *   ---------------------------------
+ * 0 |   PAGETYPE   | # OF PAGE PTRs |
+ *   |-------------------------------|
+ *   | PAGE PTR for PARENT           |
+ *   |-------------------------------|
+ *   | PAGE PTR for K#1              |
+ *   |-------------------------------|
+ *   | K#1L | KEY ...                |
+ *   .   ...                         .
+ *   |-------------------------------|
+ *   | PAGE PTR for K#2              |
+ *   |-------------------------------|
+ *   | K#2L | KEY ...                |
+ *   .   ...                         .
+ *   |-------------------------------|
+ *   .   ...                         .
+ *   |-------------------------------|
+ *   | H IDX |      |       |        |
+ *   |--------------------------------
+ *   .   ...                         .
+ *   |-------------------------------|
+ *   |       |      |       | L IDX  |
+ *   |-------------------------------|
+ *   . OPIONAL INTEGRITY/ENCRYPTION  .
+ *   .................................
+ *
+ * Key data is at the start of the page.
+ * The key index is at the bottom of
+ * the page and grows up. The keys data
+ * (len, contents and page pointer start
+ * at the top and grow down.
+ */
+const NODE_PAGETYPE: usize = POS_PAGETYPE; //u32
+const NODE_NUMPTRS: usize = 4;   // u32
+const NODE_PARENT: usize = 8;    // u64
+const NODE_FIRSTPTR: usize = 16; // u64
+
+const PAGEPTR_SIZE: usize = 8;   // u64
+const KEYIDX_SIZE: usize = 2;    // u16
+
+/* Leaf page structure:
+ *   0              32              64
+ *   ---------------------------------
+ * 0 |   PAGETYPE   | # OF PAGE PTRs |
+ *   |-------------------------------|
+ *   | PAGE PTR for PARENT           |
+ *   |-------------------------------|
+ *   | HASH OF KEY                   |
+ *   |                               |
+ *   |                               |
+ *   |                               |
+ *   |-------------------------------|
+ *   | PAGEPTRs PTR |   DATALEN      |
+ *   |-------------------------------|
+ *   .   DATA (OPTIONAL) ...                    .
+ *   |-------------------------------|
+ *   |   FIRST DATA PAGE PTR         |
+ *   |--------------------------------
+ *   .   ...                         .
+ *   |-------------------------------|
+ *   |   LAST DATA PAGE PTR          |
+ *   |-------------------------------|
+ *   . OPIONAL DATA INTEG/ENCR TAG   .
+ *   |-------------------------------|
+ *   . OPIONAL INTEGRITY/ENCRYPTION  .
+ *   .................................
+ *
+ * The number of aditional pages is
+ * dependent on DATALEN.
+ * DATALEN/RAWPAGESIZE = #PAGES
+ * Part or all of the content may also
+ * be contained directly in the Leaf
+ * page in the DATA section.
+ */
+const LEAF_PAGETYPE: usize = POS_PAGETYPE; //u32
+const LEAF_NUMPTRS: usize = 4;  // u32
+const LEAF_PARENT: usize = NODE_PARENT;   // u64
+const LEAF_KEYHASH: usize = 16; // [u8; 32]
+const LEAF_PTRSPTR: usize = 48; // u32
+const LEAF_DATALEN: usize = 52; // u32
+const LEAF_DATA: usize = 56;    // [u8]
+
 
 #[derive(Debug)]
 pub enum RmdbError {
+    InvalidDataSize,
+    KeyNotFound,
+    InvalidMetadata,
     UnalignedAccess,
     LockError,
     IntegrityCheck,
@@ -90,6 +190,9 @@ impl fmt::Display for RmdbError {
             RmdbError::IntegrityCheck => write!(f, "Integrity Check failed!"),
             RmdbError::LockError => write!(f, "Lock Poisoned Error"),
             RmdbError::UnalignedAccess => write!(f, "Unaligned Access Request"),
+            RmdbError::InvalidMetadata => write!(f, "Invalid metadata"),
+            RmdbError::KeyNotFound => write!(f, "Key not found"),
+            RmdbError::InvalidDataSize => write!(f, "Invalid data size"),
         }
     }
 }
@@ -105,6 +208,9 @@ impl Error for RmdbError {
             RmdbError::IntegrityCheck => None,
             RmdbError::LockError => None,
             RmdbError::UnalignedAccess => None,
+            RmdbError::InvalidMetadata => None,
+            RmdbError::KeyNotFound => None,
+            RmdbError::InvalidDataSize => None,
         }
     }
 }
@@ -132,6 +238,121 @@ impl Default for RmdbFlags {
     }
 }
 
+macro_rules! page_get_whole {
+    ($mmap:expr, $page:expr) => {
+        {
+            let start = ($page as usize) * RMDB_PAGESIZE;
+            let end = start + RMDB_PAGESIZE;
+            &$mmap[start..end]
+        }
+    };
+    (mut, $mmap:expr, $page:expr) => {
+        {
+            let start = ($page as usize) * RMDB_PAGESIZE;
+            let end = start + RMDB_PAGESIZE;
+            &mut $mmap[start..end]
+        }
+    };
+}
+
+macro_rules! page_get_payload {
+    ($self:ident, $mmap:expr, $page:expr) => {
+        {
+            let (start, end) = page_range($page, 0, $self.pagesize).unwrap();
+            &$mmap[start..end]
+        }
+    };
+    (mut, $self:ident, $mmap:expr, $page:expr) => {
+        {
+            let (start, end) = page_range($page, 0, $self.pagesize).unwrap();
+            &mut $mmap[start..end]
+        }
+    };
+}
+
+macro_rules! page_get_buf {
+    ($mmap:expr, $page:expr, $pos:expr, $size:expr) => {
+        {
+            let (start, end) = page_range($page, $pos, $size).unwrap();
+            &$mmap[start..end]
+        }
+    };
+    (mut, $mmap:expr, $page:expr, $pos:expr, $size:expr) => {
+        {
+            let (start, end) = page_range($page, $pos, $size).unwrap();
+            &mut $mmap[start..end]
+        }
+    };
+}
+
+macro_rules! pagebuf_get_int {
+    ($t:ident, $pagebuf:expr, $pos:expr) => {
+        {
+            let tsz = std::mem::size_of::<$t>();
+            if $pos % tsz != 0 {
+                /* enforce alignment */
+                panic!();
+            }
+            let data = &$pagebuf[$pos..($pos + tsz)];
+            $t::from_le_bytes(data.try_into().unwrap())
+        }
+    };
+}
+
+macro_rules! page_get_int {
+    ($t:ident, $mmap:expr, $page:expr, $pos:expr) => {
+        {
+            let tsz = std::mem::size_of::<$t>();
+            let (start, end) = page_range($page, $pos, tsz).unwrap();
+            pagebuf_get_int!($t, &$mmap[start..end], 0)
+        }
+    };
+}
+
+macro_rules! pagebuf_set_int {
+    ($t:ident, $pagebuf:expr, $pos:expr, $val:expr) => {
+        {
+            let tsz = std::mem::size_of::<$t>();
+            if $pos % tsz != 0 {
+                /* enforce alignment */
+                panic!();
+            }
+            $pagebuf[$pos..($pos + tsz)].copy_from_slice(&$val.to_le_bytes());
+        }
+    };
+}
+
+macro_rules! pagebuf_set_buf {
+    ($pagebuf:expr, $pos:expr, $buf:expr) => {
+        {
+            $pagebuf[$pos..($pos + $buf.len())].copy_from_slice($buf);
+        }
+    };
+}
+
+macro_rules! page_set_int {
+    ($t:ident, $mmap:expr, $page:expr, $pos:expr, $val:expr) => {
+        {
+            let tsz = std::mem::size_of::<$t>();
+            if $pos % tsz != 0 {
+                /* enforce alignment */
+                panic!();
+            }
+            let (start, end) = page_range($page, $pos, tsz).unwrap();
+            $mmap[start..end].copy_from_slice(&$val.to_le_bytes());
+        }
+    };
+}
+
+macro_rules! align {
+    ($t:ident, $value:expr) => {
+        {
+            let tsz = std::mem::size_of::<$t>();
+            ((($value + tsz - 1) % tsz) * tsz)
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RmdbSel {
     readpage: u64,          // the read root page
@@ -142,6 +363,7 @@ struct RmdbSel {
 pub struct Rmdb {
     path: PathBuf,          // file name for db
     file: File,             // file handle
+    pagesize: usize,        // size of pages
     num_pages: u64,         // max num pages allocated
     flags: RmdbFlags,       // db flags
     select: Mutex<RmdbSel>, // the global read/write selector
@@ -184,8 +406,9 @@ impl Rmdb {
 
         let mut rmdb = Rmdb {
             path: path,
+            pagesize: page_size(dflags),
             num_pages: pages,
-            flags: flags,
+            flags: dflags,
             select: Mutex::new(
                 RmdbSel {
                     readpage: 1,
@@ -207,10 +430,9 @@ impl Rmdb {
 
         if initialize {
             rmdb.initialize()?;
-        } else {
-            rmdb.integrity_check()?;
         }
         rmdb.setup()?;
+        rmdb.integrity_check()?;
         Ok(rmdb)
     }
 
@@ -220,21 +442,23 @@ impl Rmdb {
         page.set_buf(RMDB_P_SIG, "RMDB".as_bytes())?;
         page.set_buf(RMDB_P_VER, &RMDB_FILEVER.to_le_bytes())?;
         page.set_buf(RMDB_P_FLAGS, &flags.bits().to_le_bytes())?;
-        /* always point to first page on initialization */
-        page.set_u64(RMDB_P_FLAGS, 1)?;
+        page.set_u64(RMDB_P_RMAIN, 1)?;
+        page.set_u64(RMDB_P_WMAIN, 2)?;
         drop(page);
         let pagesize = page_size(self.flags());
         for i in 1..3 {
             let mut page = self.get_write_page(i).unwrap();
-            let freepagessize = pagesize - 8 - 8;
+            let freepagessize = pagesize - (PAGEPTR_SIZE * 2) - MAIN_FREEPAGES;
             let mut freepages = vec![u8::MAX; freepagessize];
             /* First three pages are always taken */
             freepages[0] = freepages[0] >> 3;
-            page.set_buf(0, &freepages)?;
+            page.set_buf(MAIN_FREEPAGES, &freepages)?;
             /* Initial db has only one free page buf */
-            page.set_u64(freepagessize, 0)?;
+            page.set_u64(MAIN_FREEPAGES + freepagessize, 0)?;
             /* and points to no root node page */
             page.set_u64(pagesize - 8, 0)?;
+            /* mark page type */
+            page.set_u32(POS_PAGETYPE, PAGE_MAIN | PAGE_DIRTY)?;
             drop(page)
         }
         Ok(())
@@ -248,6 +472,26 @@ impl Rmdb {
         if page.get_buf(RMDB_P_VER, 4).unwrap() != &RMDB_FILEVER.to_le_bytes() {
             return Err(RmdbError::IntegrityCheck)
         }
+
+        /* check read and write main pages */
+
+        /* block writers */
+        let _wmap = self.wmap.lock().unwrap();
+        let select = self.select.lock().unwrap();
+        let rmap = self.rmap.read().unwrap();
+
+        let page = page_get_payload!(self, rmap, select.readpage);
+        let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+        if ptype & PAGE_MAIN == 0 {
+            return Err(RmdbError::IntegrityCheck)
+        }
+
+        let page = page_get_payload!(self, rmap, select.writepage);
+        let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+        if ptype & PAGE_MAIN == 0 {
+            return Err(RmdbError::IntegrityCheck)
+        }
+
         Ok(())
     }
 
@@ -266,17 +510,18 @@ impl Rmdb {
         } else {
             self.flags |= !RmdbFlags::PAGE_INTEGRITY;
         }
+        self.pagesize = page_size(self.flags);
 
         /* Set current root pages */
 
         /* block writers */
-        let mut wmap = self.wmap.lock().unwrap();
+        let wmap = self.wmap.lock().unwrap();
 
         /* block any access to root page selection */
         let mut select = self.select.lock().unwrap();
 
         /* wait until all readers are done */
-        let mut rmap = self.rmap.write().unwrap();
+        let rmap = self.rmap.write().unwrap();
 
         select.writepage = wmain;
         select.readpage = rmain;
@@ -297,7 +542,7 @@ impl Rmdb {
         let mut wmap = self.wmap.lock().unwrap();
 
         /* block any access to root page selection */
-        let mut select = self.select.lock().unwrap();
+        let select = self.select.lock().unwrap();
 
         /* wait until all readers are done */
         let mut rmap = self.rmap.write().unwrap();
@@ -345,8 +590,8 @@ impl Rmdb {
 
         Ok(RmdbPage {
             rmap: rmap,
-            flags: self.flags,
-            readpage: readpage,
+            _flags: self.flags,
+            _readpage: readpage,
             page: page,
         })
     }
@@ -363,9 +608,10 @@ impl Rmdb {
         Ok(RmdbWPage {
             wmap: wmap,
             flags: self.flags,
-            writepage: writepage,
-            readpage: readpage,
+            _writepage: writepage,
+            _readpage: readpage,
             page: page,
+            pagesize: self.pagesize,
         })
     }
 
@@ -380,6 +626,7 @@ impl Rmdb {
             flags: self.flags,
             status: RmdbTxnState::Open,
             readpage: readpage,
+            pagesize: self.pagesize,
         })
     }
 
@@ -388,7 +635,6 @@ impl Rmdb {
         let select = self.select.lock().unwrap();
         let writepage = select.writepage;
         let readpage = select.readpage;
-        let rmap = self.rmap.read().unwrap();
         drop(select);
         let mut txn = RmdbWTxn {
             wmap: wmap,
@@ -396,7 +642,9 @@ impl Rmdb {
             status: RmdbTxnState::Open,
             writepage: writepage,
             readpage: readpage,
-            mainpage: [0; RMDB_PAGESIZE]
+            pagesize: self.pagesize,
+            mainpage: [0; RMDB_PAGESIZE],
+            dirtypages: Vec::new(),
         };
 
         let page = self.get_read_page(0)?;
@@ -445,51 +693,14 @@ fn page_integrity_check(mmap: &Mmap, flags: RmdbFlags, page: u64)
     Ok(())
 }
 
-fn get_u64(mmap: &Mmap, page: u64, pos: usize) -> Result<u64, RmdbError> {
-    if pos % std::mem::size_of::<u64>() != 0 {
-        /* enforce alignment */
-        return Err(RmdbError::UnalignedAccess)
-    }
-    let (start, end) = page_range(page, pos, std::mem::size_of::<u64>())?;
-    let data = mmap.get(start..end).unwrap();
-    Ok(u64::from_le_bytes(data.try_into().unwrap()))
-}
-
-fn get_buf<'a>(mmap: &'a Mmap, page: u64, pos: usize, size: usize)
-                                                -> Result<&'a [u8], RmdbError> {
-    let (start, end) = page_range(page, pos, size)?;
-    Ok(&mmap[start..end])
-}
-
-fn set_u64(mmap: &mut MmapMut, page: u64, pos: usize, value: u64)
-                                                -> Result<(), RmdbError> {
-    if pos % std::mem::size_of::<u64>() != 0 {
-        /* enforce alignment */
-        return Err(RmdbError::UnalignedAccess)
-    }
-    let (start, end) = page_range(page, pos, std::mem::size_of::<u64>())?;
-    let data = mmap.get_mut(start..end).unwrap();
-    data.copy_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn set_buf(mmap: &mut MmapMut, page: u64, pos: usize, buf: &[u8])
-                                                -> Result<(), RmdbError> {
-    let (start, end) = page_range(page, pos, buf.len())?;
-    let data = mmap.get_mut(start..end).unwrap();
-    data.copy_from_slice(buf);
-    Ok(())
-}
-
 fn integrity_protect(mmap: &mut MmapMut, flags: RmdbFlags, page: u64)
                                                 -> Result<(), RmdbError> {
-    if !flags.contains(RmdbFlags::PAGE_INTEGRITY) {
-        return Ok(())
+    if flags.contains(RmdbFlags::PAGE_INTEGRITY) {
+        let page = page_get_whole!(mut, mmap, page);
+        let hash = compute_hash(&page[0..(RMDB_PAGESIZE - 32)]);
+        page[(RMDB_PAGESIZE - 32)..RMDB_PAGESIZE].copy_from_slice(&hash);
     }
-    let (start, end) = page_range(page, 0, RMDB_PAGESIZE - 32)?;
-    let data = mmap.get_mut(start..end).unwrap();
-    let hash = compute_hash(data);
-    set_buf(mmap, page, RMDB_PAGESIZE - 32, &hash)
+    Ok(())
 }
 
 fn page_flush(mmap: &mut MmapMut, flags: RmdbFlags, page: u64)
@@ -505,39 +716,61 @@ fn page_flush(mmap: &mut MmapMut, flags: RmdbFlags, page: u64)
 
 pub struct RmdbPage<'a> {
     rmap: RwLockReadGuard<'a, Mmap>,
-    flags: RmdbFlags,
-    readpage: u64,
+    _flags: RmdbFlags,
+    _readpage: u64,
     page: u64,
 }
 
 impl RmdbPage<'_> {
     pub fn get_u64(&self, pos: usize) -> Result<u64, RmdbError> {
-        get_u64(&*self.rmap, self.page, pos)
+        Ok(page_get_int!(u64, &*self.rmap, self.page, pos))
     }
 
     pub fn get_buf<'a>(&'a self, pos: usize, size: usize)
                                             -> Result<&'a [u8], RmdbError> {
-        get_buf(&*self.rmap, self.page, pos, size)
+        Ok(page_get_buf!(&*self.rmap, self.page, pos, size))
     }
 }
 
 pub struct RmdbWPage<'a> {
     wmap: MutexGuard<'a, MmapMut>,
     flags: RmdbFlags,
-    writepage: u64,
-    readpage: u64,
+    _writepage: u64,
+    _readpage: u64,
     page: u64,
+    pagesize: usize,
 }
 
 impl RmdbWPage<'_> {
     pub fn set_u64(&mut self, pos: usize, value: u64)
                                                 -> Result<(), RmdbError> {
-        set_u64(&mut *self.wmap, self.page, pos, value)
+        if pos % std::mem::size_of::<u64>() != 0 {
+            /* enforce alignment */
+            return Err(RmdbError::UnalignedAccess)
+        }
+        let mut buf = page_get_buf!(mut, self.wmap, self.page,
+                                    pos, std::mem::size_of::<u64>());
+        pagebuf_set_int!(u64, &mut buf, 0, value);
+        Ok(())
+    }
+
+    pub fn set_u32(&mut self, pos: usize, value: u32)
+                                                -> Result<(), RmdbError> {
+        if pos % std::mem::size_of::<u32>() != 0 {
+            /* enforce alignment */
+            return Err(RmdbError::UnalignedAccess)
+        }
+        let mut buf = page_get_buf!(mut, self.wmap, self.page,
+                                    pos, std::mem::size_of::<u32>());
+        pagebuf_set_int!(u32, &mut buf, 0, value);
+        Ok(())
     }
 
     pub fn set_buf(&mut self, pos: usize, buf: &[u8])
                                                 -> Result<(), RmdbError> {
-        set_buf(&mut *self.wmap, self.page, pos, buf)
+        let mut page = page_get_payload!(mut, self, self.wmap, self.page);
+        pagebuf_set_buf!(&mut page, pos, buf);
+        Ok(())
     }
 }
 
@@ -576,12 +809,104 @@ pub struct RmdbTxn<'a> {
     rmap: RwLockReadGuard<'a, Mmap>,
     flags: RmdbFlags,
     status: RmdbTxnState,
+    pagesize: usize,        // size of pages
     readpage: u64,
 }
 
+macro_rules! get_root {
+    ($self:ident, $mmap:expr, $mainpage:expr) => {
+        {
+            let page = page_get_payload!($self, $mmap, $mainpage);
+            pagebuf_get_int!(u64, page, page.len() - 8)
+        }
+    };
+}
+
+// returns root when key not found
+macro_rules! get_leaf {
+    ($self:ident, $mmap:expr, $node:expr, $key:expr) => {
+        {
+            let page = page_get_payload!($self, $mmap, $node);
+            let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+            if ptype & PAGE_LEAF == PAGE_LEAF {
+                return Ok($node);
+            }
+            if ptype & PAGE_NODE != PAGE_NODE {
+                return Err(RmdbError::InvalidMetadata);
+            }
+            let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
+            if nptrs == 0 {
+                return Err(RmdbError::KeyNotFound);
+            }
+            /* TODO: change to a bisect */
+            let idx = $self.pagesize - 2 * nptrs;
+            let mut node = 0u64;
+            for n in 0..nptrs {
+                let ptr = pagebuf_get_int!(u16, page, idx + (n * 2)) as usize;
+                let len = pagebuf_get_int!(u16, page, ptr + 8) as usize;
+                let pkey = &page[(ptr + 10)..(ptr + 10 + len)];
+                node = pagebuf_get_int!(u64, page, ptr);
+                if $key >= pkey {
+                    return $self.get_leaf(node, $key);
+                }
+            }
+            /* not found, return lowmost index node,
+             * the last in the loop */
+            return $self.get_leaf(node, $key);
+        }
+    };
+}
+
+macro_rules! get_data {
+    ($self:ident, $mmap:expr, $leaf: expr) => {
+        {
+            /* TODO: check integrity */
+            let page = page_get_payload!($self, $mmap, $leaf);
+            let ptype = pagebuf_get_int!(u32, page, LEAF_PAGETYPE);
+            if ptype & PAGE_LEAF != PAGE_LEAF {
+                return Err(RmdbError::InvalidMetadata);
+            }
+            let pages = pagebuf_get_int!(u32, page, LEAF_NUMPTRS) as usize;
+            let mut len = pagebuf_get_int!(u32, page, LEAF_DATALEN) as usize;
+            let mut res = Vec::with_capacity(pages+1);
+            if pages * RMDB_PAGESIZE < len {
+                let diplen = len % RMDB_PAGESIZE;
+                let dataptr = LEAF_DATA as usize;
+                res.push(&page[dataptr..(dataptr + diplen)]);
+                len -= diplen;
+            }
+            let mut leaf_pagesize = $self.pagesize;
+            if $self.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
+                leaf_pagesize -= 32;
+            }
+            let pageptr = leaf_pagesize - 8 * pages;
+            for n in 0..pages {
+                let mut size = RMDB_PAGESIZE;
+                if len < size {
+                    size = len;
+                }
+                len -= RMDB_PAGESIZE;
+                let ptr = pagebuf_get_int!(u64, page, pageptr + n * 8);
+                res.push(page_get_buf!($mmap, ptr, 0, size));
+            }
+            Ok(res)
+        }
+    };
+}
+
 impl RmdbTxn<'_> {
+
+    fn get_leaf(&self, parent: u64, key: &[u8]) -> Result<u64, RmdbError> {
+        get_leaf!(self, self.rmap, parent, key)
+    }
+
     pub fn get_entry(&self, key: &[u8]) -> Result<Vec<&[u8]>, RmdbError> {
-        Err(RmdbError::InvalidTransaction)
+        let rootpage = get_root!(self, self.rmap, self.readpage);
+        if rootpage == 0 {
+            return Err(RmdbError::KeyNotFound);
+        }
+        let leaf = self.get_leaf(rootpage, key)?;
+        get_data!(self, self.rmap, leaf)
     }
 
     fn _scrub(&mut self) {
@@ -613,19 +938,310 @@ pub struct RmdbWTxn<'a> {
     status: RmdbTxnState,
     writepage: u64,
     readpage: u64,
+    pagesize: usize,        // size of pages
     mainpage: [u8; RMDB_PAGESIZE],
+    dirtypages: Vec<u64>,
 }
 
 impl RmdbWTxn<'_> {
-    pub fn get_entry(&self, key: &[u8]) -> Result<Vec<&[u8]>, RmdbError> {
-        Err(RmdbError::InvalidTransaction)
+
+    fn get_free_pages(&mut self, n:usize) -> Result<Vec<u64>, RmdbError> {
+        let mut page = page_get_payload!(mut, self, self.wmap, self.writepage);
+        get_free_pages(&mut page, self.pagesize, n)
     }
 
-    pub fn add_entry(&mut self, key: &[u8], value: &[u8]) -> Result<(), RmdbError> {
-        write_entry(&mut *self.wmap, self.flags, &mut self.mainpage, key, value)
+    fn get_root(&mut self, allocate: bool) -> Result<u64, RmdbError> {
+        let mut rootpage = get_root!(self, self.wmap, self.writepage);
+        if rootpage == 0 {
+            if !allocate {
+                return Err(RmdbError::KeyNotFound)
+            }
+            rootpage = self.get_free_pages(1)?[0];
+            let mut writepage = page_get_payload!(mut, self, self.wmap,
+                                                   self.writepage);
+            pagebuf_set_int!(u64, &mut writepage,
+                             self.pagesize - 8, rootpage);
+            pagebuf_set_int!(u32, &mut writepage,
+                             POS_PAGETYPE, PAGE_MAIN | PAGE_DIRTY);
+            let mut page = page_get_payload!(mut, self, self.wmap, rootpage);
+            pagebuf_set_int!(u32, &mut page,
+                             NODE_PAGETYPE, PAGE_NODE | PAGE_DIRTY);
+            pagebuf_set_int!(u32, &mut page,
+                             NODE_NUMPTRS, 0u32);
+            self.dirtypages.push(rootpage);
+        }
+
+        Ok(rootpage)
+    }
+
+    fn get_leaf(&self, parent: u64, key: &[u8]) -> Result<u64, RmdbError> {
+        get_leaf!(self, self.wmap, parent, key)
+    }
+
+    pub fn get_entry(&mut self, key: &[u8]) -> Result<Vec<&[u8]>, RmdbError> {
+        let rootpage = self.get_root(false)?;
+
+        let leaf = self.get_leaf(rootpage, key)?;
+
+        get_data!(self, self.wmap, leaf)
+    }
+
+    pub fn add_entry(&mut self, key: &[u8], value: &[u8])
+                                                -> Result<(), RmdbError> {
+        let rootpage = self.get_root(true)?;
+
+        /* create new pages */
+        let datalen = value.len() as u32;
+        let mut dataptr = 0usize;
+        let mut pages = datalen / RMDB_PAGESIZE as u32;
+        let overflow = datalen % RMDB_PAGESIZE as u32;
+        let mut leaf_pagesize = self.pagesize;
+        if self.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
+            leaf_pagesize -= 32;
+        }
+        let overhead = 8 * pages as usize + LEAF_DATA;
+        if leaf_pagesize < overhead {
+            return Err(RmdbError::InvalidDataSize);
+        }
+        let avail_space = leaf_pagesize - overhead;
+        if avail_space < overflow as usize {
+            if avail_space < 8 {
+                return Err(RmdbError::InvalidDataSize);
+            }
+            pages += 1;
+        } else {
+            dataptr = overflow as usize;
+        }
+
+        let pagevec = self.get_free_pages(pages as usize + 1)?;
+
+        /* write leaf page */
+        let leaf = pagevec[0];
+        let mut leafpage = page_get_payload!(mut, self, self.wmap, leaf);
+
+        /* mark page as dirty until integrity check applied */
+        pagebuf_set_int!(u32, &mut leafpage,
+                         LEAF_PAGETYPE, PAGE_LEAF | PAGE_DIRTY);
+
+        pagebuf_set_int!(u32, &mut leafpage, LEAF_NUMPTRS, pages);
+
+        let keyhash = compute_hash(key);
+        pagebuf_set_buf!(&mut leafpage, LEAF_KEYHASH, &keyhash);
+
+        let mut pageptr = 0usize;
+        if pages > 0 {
+            pageptr = leaf_pagesize - (8 * pages) as usize;
+        }
+        pagebuf_set_int!(u32, &mut leafpage, LEAF_PTRSPTR, pageptr as u32);
+
+        pagebuf_set_int!(u32, &mut leafpage, LEAF_DATALEN, datalen);
+
+        //TODO: compute hash as we store data
+        if self.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
+            let hash = compute_hash(value);
+            pagebuf_set_buf!(&mut leafpage, leaf_pagesize, &hash);
+        }
+
+        /* must do this in its own loop for borrow checker */
+        for i in 1..(pages as usize + 1) {
+            /* add page pointer to leaf page */
+            pagebuf_set_int!(u64, &mut leafpage, pageptr, pagevec[i]);
+            pageptr += 8;
+        }
+
+        /* write data to pages */
+        if dataptr > 0 {
+            pagebuf_set_buf!(&mut leafpage, LEAF_DATA, &value[0..dataptr]);
+        }
+
+        /* drop here to allow following code to manipulate other pages */
+        drop(leafpage);
+
+        for i in 1..(pages as usize + 1) {
+            /* then write the data */
+            let mut datapage = page_get_whole!(mut, self.wmap, pagevec[i]);
+            let start = dataptr;
+            let mut end = dataptr + RMDB_PAGESIZE;
+            if value.len() - dataptr < RMDB_PAGESIZE {
+                end = value.len();
+            }
+            pagebuf_set_buf!(&mut datapage, 0, &value[start..end]);
+            dataptr += RMDB_PAGESIZE;
+        }
+
+        self.dirtypages.push(leaf);
+        /* then add them to the tree */
+        let cur_leaf = self.get_leaf(rootpage, key);
+        let cur_leaf = match cur_leaf {
+            Ok(cur_leaf) => cur_leaf,
+            Err(error) => {
+                match error {
+                    RmdbError::KeyNotFound => 0u64,
+                    _ => return Err(error),
+                }
+            },
+        };
+        let parent: u64;
+        if cur_leaf == 0 {
+            // adding a new key, find space
+            parent = self.add_page(rootpage, leaf, key)?;
+        } else {
+            // we are replacing a leaf, free all related pages
+            self.delete_page(cur_leaf)?;
+            parent = self.replace_page(cur_leaf, leaf)?;
+        }
+        /* change parent node on leaf now */
+        let mut leafpage = page_get_payload!(mut, self, self.wmap, leaf);
+        pagebuf_set_int!(u64, &mut leafpage, LEAF_PARENT, parent);
+
+        Ok(())
+    }
+
+    fn delete_page(&mut self, pagenum: u64) -> Result<(), RmdbError> {
+        let mut pvec = Vec::new();
+        pvec.push(pagenum);
+        let page = page_get_payload!(self, self.wmap, pagenum);
+        let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+        if ptype & PAGE_LEAF != 0 {
+            let pages = pagebuf_get_int!(u32, page, LEAF_NUMPTRS);
+            let mut pageptr = pagebuf_get_int!(u32, page, LEAF_PTRSPTR);
+            for _ in 0..pages {
+                pvec.push(pagebuf_get_int!(u64, page, pageptr as usize));
+                pageptr += 8;
+            }
+        }
+
+        let mut page = page_get_payload!(mut, self, self.wmap, self.writepage);
+        put_free_pages(&mut page, pvec)
+    }
+
+    fn replace_childptr(&mut self, parent: u64, curptr: u64, newptr: u64)
+            -> Result<(), RmdbError> {
+        let mut page = page_get_payload!(mut, self, self.wmap, parent);
+        let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
+        if nptrs == 0 {
+            return Err(RmdbError::KeyNotFound);
+        }
+        for n in 0..nptrs {
+            let idx = self.pagesize - KEYIDX_SIZE * (n + 1);
+            let ptr = pagebuf_get_int!(u16, page, idx) as usize;
+            let pageptr = pagebuf_get_int!(u64, page, ptr);
+            if pageptr == curptr {
+                pagebuf_set_int!(u64, &mut page, ptr, newptr);
+                return Ok(());
+            }
+        }
+        Err(RmdbError::KeyNotFound)
+    }
+
+    fn page_copy(&mut self, src: u64, dst: u64) -> Result<(), RmdbError> {
+
+        let (sh, st) = page_range(src, 0, RMDB_PAGESIZE)?;
+        let (dh, dt) = page_range(dst, 0, RMDB_PAGESIZE)?;
+        if src > dst {
+            let (dbuf, sbuf) = self.wmap.split_at_mut(sh);
+            dbuf[dh..dt].copy_from_slice(&sbuf[0..RMDB_PAGESIZE]);
+        } else {
+            let (sbuf, dbuf) = self.wmap.split_at_mut(dh);
+            dbuf[0..RMDB_PAGESIZE].copy_from_slice(&sbuf[sh..st]);
+        }
+        Ok(())
+    }
+
+    fn get_new_page_copy(&mut self, source: u64) -> Result<u64, RmdbError> {
+        let newcopy = self.get_free_pages(1)?[0];
+
+        self.page_copy(source, newcopy)?;
+
+        Ok(newcopy)
+    }
+
+    fn replace_page(&mut self, curchild: u64, newchild: u64)
+            -> Result<u64, RmdbError> {
+        /* NODE_PARENT and LEAF_PARENT guaranteed to be in the same place */
+        let mut parent = page_get_int!(u64, self.wmap, curchild, NODE_PARENT);
+        let ptype = page_get_int!(u32, self.wmap, parent, POS_PAGETYPE);
+        if ptype & PAGE_DIRTY == 0 {
+            /* page not dirty, we mut Copy on Write */
+            parent = self.get_new_page_copy(parent)?;
+            /* mark page as dirty until integrity check applied */
+            page_set_int!(u32, self.wmap, parent, NODE_PAGETYPE,
+                          PAGE_NODE | PAGE_DIRTY);
+            self.dirtypages.push(parent);
+        }
+        self.replace_childptr(parent, curchild, newchild)?;
+
+        Ok(parent)
+    }
+
+    /* FIXME: this adds only one leaf directly to the parent, no layering */
+    fn add_page(&mut self, rootpage: u64, leaf: u64, key: &[u8])
+            -> Result<u64, RmdbError> {
+        let page = page_get_payload!(mut, self, self.wmap, rootpage);
+        /* check if enough space in page to add key */
+        let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
+        /* find highest index */
+        let idx = self.pagesize - 2 * nptrs;
+        let mut hptr = NODE_FIRSTPTR;
+        for n in 0..nptrs {
+            let ptr = pagebuf_get_int!(u16, page, idx + (2 * n)) as usize;
+            if ptr > hptr {
+                hptr = ptr;
+            }
+        };
+        /* get keylen of last key */
+        let len = pagebuf_get_int!(u16, page, hptr + 8) as usize;
+        /* get floor aligned to u64 */
+        let floor = align!(u64, (hptr + 10 + len));
+        let ceil = self.pagesize - 2 * nptrs;
+        if ceil - floor < PAGEPTR_SIZE + 2 + key.len() + KEYIDX_SIZE {
+            //TODO: split tree and add nodes
+            return Err(RmdbError::InvalidDataSize);
+        }
+
+        /* add key slot */
+        pagebuf_set_int!(u64, page, floor, leaf);
+        pagebuf_set_int!(u16, page, floor + PAGEPTR_SIZE, key.len() as u16);
+        pagebuf_set_buf!(page, floor + PAGEPTR_SIZE + 2, key);
+
+        /* add key to index */
+        let mut idx = self.pagesize - 2 * nptrs;
+        for _ in 0..nptrs {
+            let ptr = pagebuf_get_int!(u16, page, idx) as usize;
+            let len = pagebuf_get_int!(u16, page, ptr + 8) as usize;
+            let pkey = &page[(ptr + 10)..(ptr + 10 + len)];
+            if key == pkey {
+                return Err(RmdbError::InvalidMetadata);
+            }
+            idx += 2;
+            if key < pkey {
+                break;
+            }
+        }
+        /* we found the insertion point, add key index here, and move,
+         * all other upwards */
+        let mptrs = (self.pagesize - idx) / 2;
+        idx -= 2;
+        let mut lptr = pagebuf_get_int!(u16, page, idx);
+        pagebuf_set_int!(u16, page, idx, floor as u16);
+        for _ in 0..mptrs {
+            idx -= 2;
+            let hptr = pagebuf_get_int!(u16, page, idx);
+            pagebuf_set_int!(u16, page, idx, lptr);
+            lptr = hptr;
+        }
+
+        pagebuf_set_int!(u32, page, NODE_NUMPTRS, nptrs as u32 + 1);
+
+        //TODO: return the real leaf parent
+        Ok(rootpage)
     }
 
     fn _scrub(&mut self) {
+        /* make sure to copy readpage over writepage, to wipe out any changes
+         * that my ahve happened there */
+        self.page_copy(self.readpage, self.writepage).unwrap();
+
         self.status = RmdbTxnState::Scrubbed
     }
 
@@ -637,28 +1253,49 @@ impl RmdbWTxn<'_> {
         Ok(())
     }
 
-    pub fn commit(&mut self, rmdb: Rmdb) -> Result<(), RmdbError> {
+    fn finalize_page(&mut self, page: u64)
+            -> Result<(), RmdbError> {
+        if page != 0 {
+            let mut pagebuf = page_get_whole!(mut, self.wmap, page);
+            let mut ptype = pagebuf_get_int!(u32, pagebuf, POS_PAGETYPE);
+            if ptype & PAGE_DIRTY != 0 {
+                ptype &= !PAGE_DIRTY;
+                pagebuf_set_int!(u32, &mut pagebuf, POS_PAGETYPE, ptype);
+            }
+        }
+        integrity_protect(&mut *self.wmap, self.flags, page)?;
+        page_flush(&mut *self.wmap, self.flags, page)
+    }
+
+    pub fn commit(&mut self, rmdb: &Rmdb) -> Result<(), RmdbError> {
+
+        /* integrity check all dirty pages */
+        let pages = self.dirtypages.to_vec();
+        for dirty in pages {
+            self.finalize_page(dirty)?;
+        }
+        /* and finally the writepage too */
+        self.finalize_page(self.writepage)?;
 
         /* block any access to root page selection */
         let mut select = rmdb.select.lock().unwrap();
 
         /* wait until all readers are done */
-        let mut rmap = rmdb.rmap.write().unwrap();
+        let rmap = rmdb.rmap.write().unwrap();
 
         /* now reset and swap read and write pages */
-        let rswap = &self.mainpage[RMDB_P_WMAIN..(RMDB_P_WMAIN+8)];
-        let wswap = &self.mainpage[RMDB_P_RMAIN..(RMDB_P_RMAIN+8)];
-        let rmain = u64::from_le_bytes(rswap.try_into().unwrap());
-        let wmain = u64::from_le_bytes(wswap.try_into().unwrap());
+        let rmain = pagebuf_get_int!(u64, self.mainpage, RMDB_P_WMAIN);
+        let wmain = pagebuf_get_int!(u64, self.mainpage, RMDB_P_RMAIN);
+        pagebuf_set_int!(u64, self.mainpage, RMDB_P_RMAIN, rmain);
+        pagebuf_set_int!(u64, self.mainpage, RMDB_P_WMAIN, wmain);
 
         select.writepage = wmain;
         select.readpage = rmain;
 
         /* finally flush mainpage to disk */
-        let pagesize = page_size(self.flags);
-        set_buf(&mut *self.wmap, 0, 0, &self.mainpage[0..pagesize])?;
-        integrity_protect(&mut *self.wmap, self.flags, 0)?;
-        page_flush(&mut *self.wmap, self.flags, 0)?;
+        let mut page = page_get_payload!(mut, self, self.wmap, 0);
+        pagebuf_set_buf!(&mut page, 0, &self.mainpage[0..self.pagesize]);
+        self.finalize_page(0)?;
         self.status = RmdbTxnState::Committed;
 
         drop(rmap);
@@ -677,31 +1314,43 @@ impl Drop for RmdbWTxn<'_> {
 }
 
 // TODO: need to add support for multiple free page buffers
-fn get_free_page(freepages: &mut [u8]) -> Result<u64, RmdbError> {
-    for i in 0..freepages.len() {
-        if freepages[i] != 0xff {
-            for j in 0..7 {
-                let x = 0b10000000u8 >> j;
-                let val = freepages[i] | x;
-                if val != freepages[i] {
-                    freepages[i] = val;
-                    return Ok((i * 8 + j) as u64);
+fn get_free_pages(mainpage: &mut [u8], pagesize: usize, n: usize)
+        -> Result<Vec<u64>, RmdbError> {
+    let mut res = Vec::with_capacity(n);
+
+    let base = MAIN_FREEPAGES;
+    let fsize = pagesize - 16 - MAIN_FREEPAGES;
+
+    //TODO: try to allocate consecutive blocks
+    for _ in 0..n {
+        'page:for i in 0..fsize {
+            if mainpage[base + i] != 0 {
+                for j in 0..7 {
+                    let x = 0b10000000u8 >> j;
+                    if mainpage[base + i] & x == x {
+                        mainpage[base + i] &= !x;
+                        res.push((i * 8 + j) as u64);
+                        break 'page;
+                    }
                 }
             }
         }
     }
-    Err(RmdbError::InvalidIndexSize)
+    if res.len() != n {
+        Err(RmdbError::InvalidIndexSize)
+    } else {
+        //TODO: clear pages before returing them?
+        Ok(res)
+    }
 }
 
-fn write_entry(mmap: &mut MmapMut, flags: RmdbFlags, mainpage: &mut [u8],
-               key: &[u8], value: &[u8]) -> Result<(), RmdbError> {
-    let pagesize = page_size(flags);
-
-    let mut rootpage = u64::from_le_bytes(
-                        mainpage[(pagesize - 8)..pagesize].try_into().unwrap());
-    if rootpage == 0 {
-        rootpage = get_free_page(&mut mainpage[0..(pagesize - 16)])?;
+fn put_free_pages(mainpage: &mut [u8], pvec: Vec<u64>)
+        -> Result<(), RmdbError> {
+    let base = MAIN_FREEPAGES;
+    for p in pvec {
+        let u = (p / 8) as usize;
+        let v = (p % 8) as u8;
+        mainpage[base + u] &= !v;
     }
-
     Ok(())
 }
