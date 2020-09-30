@@ -1206,7 +1206,7 @@ fn get_free_pages(mainpage: &mut [u8], pagesize: usize, n: usize)
     for _ in 0..n {
         'page:for i in 0..fsize {
             if mainpage[base + i] != 0 {
-                for j in 0..7 {
+                for j in 0..8 {
                     let x = 0b10000000u8 >> j;
                     if mainpage[base + i] & x == x {
                         mainpage[base + i] &= !x;

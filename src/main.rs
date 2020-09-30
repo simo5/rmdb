@@ -19,27 +19,8 @@ fn main() {
     let name = db_filename("test1db.rmdb");
     let flags = <RmdbFlags as Default>::default() | RmdbFlags::PAGE_INTEGRITY;
     let rmdb = Arc::new(Rmdb::open(PathBuf::from(name), flags, true).unwrap());
-    let mut handles = vec![];
-
-    for t in 0..10 {
-        let rmdb = Arc::clone(&rmdb);
-        let handle = thread::spawn(move || {
-            //let mut page = rmdb.get_write_page(10+t).unwrap();
-            //page.set_u64(pagesize -16, t).unwrap();
-            //drop(page);
-            //let page = rmdb.get_read_page(10+t).unwrap();
-            //println!("Page {} value from Thread{}: {}",
-            //         10+t, t, page.get_u64(pagesize - 16).unwrap());
-            //drop(page);
-        });
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
     let mut txn = rmdb.get_write_transaction().unwrap();
+
     let result = txn.add_entry(b"test", b"value");
     match result {
         Ok(()) => (),
@@ -48,15 +29,33 @@ fn main() {
             return();
         },
     };
-    let value = txn.get_entry(b"test");
-    let value = match value {
-        Ok(value) => value,
-        Err(error) => {
-            println!("Get error: {}", error);
-            return();
-        },
-    };
+    let value = txn.get_entry(b"test").unwrap();
     println!("Value = {}", std::str::from_utf8(&value[0]).unwrap());
     txn.commit(&*rmdb).unwrap();
     drop(txn);
+
+    let mut handles = vec![];
+    for t in 0..10 {
+        let rmdb = Arc::clone(&rmdb);
+        let handle = thread::spawn(move || {
+            if t % 2 == 0 {
+                let mut txn = rmdb.get_write_transaction().unwrap();
+                let key = format!("test{}", t);
+                let value = format!("value{}", t);
+                txn.add_entry(key.as_bytes(), value.as_bytes()).unwrap();
+                txn.commit(&*rmdb).unwrap();
+            } else {
+                let txn = rmdb.get_read_transaction().unwrap();
+                let key = format!("test{}", t - 1);
+                let value = txn.get_entry(key.as_bytes()).unwrap();
+                println!("Value '{}' from thread {}",
+                         std::str::from_utf8(&value[0]).unwrap(), t);
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }
