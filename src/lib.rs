@@ -86,21 +86,9 @@ const PAGE_DIRTY: u32 = 1u32 << 31;
  *   |-------------------------------|
  *   | PAGE PTR for K#1              |
  *   |-------------------------------|
- *   | K#1L | KEY ...                |
- *   .   ...                         .
- *   |-------------------------------|
  *   | PAGE PTR for K#2              |
  *   |-------------------------------|
- *   | K#2L | KEY ...                |
  *   .   ...                         .
- *   |-------------------------------|
- *   .   ...                         .
- *   |-------------------------------|
- *   | H IDX |      |       |        |
- *   |--------------------------------
- *   .   ...                         .
- *   |-------------------------------|
- *   |       |      |       | L IDX  |
  *   |-------------------------------|
  *   . OPIONAL INTEGRITY/ENCRYPTION  .
  *   .................................
@@ -116,7 +104,6 @@ const NODE_NUMPTRS: usize = 4;   // u32
 const NODE_FIRSTPTR: usize = 8;  // u64
 
 const PAGEPTR_SIZE: usize = 8;   // u64
-const KEYIDX_SIZE: usize = 2;    // u16
 
 /* Leaf page structure:
  *   0              32              64
@@ -288,6 +275,14 @@ macro_rules! pagebuf_get_int {
             }
             let data = &$pagebuf[$pos..($pos + tsz)];
             $t::from_le_bytes(data.try_into().unwrap())
+        }
+    };
+}
+
+macro_rules! pagebuf_get_buf {
+    ($pagebuf:expr, $pos:expr, $len: expr) => {
+        {
+            &$pagebuf[$pos..($pos + $len)]
         }
     };
 }
@@ -725,8 +720,19 @@ fn get_data<'a>(rmap: &'a [u8], pagesize: usize, leafnum: u64)
     Ok(res)
 }
 
-// page here must be only the payload, not the raw page,
-// page.len() MUST be == self.pagesize
+fn get_leaf_key(mmap: &[u8], leaf: u64) -> Result<&[u8], RmdbError> {
+    let page = page_get_payload!(mmap, RMDB_PAGESIZE, leaf);
+    let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+    if ptype & PAGE_LEAF == PAGE_LEAF {
+        let klen = pagebuf_get_int!(u16, page, LEAF_KEYLEN) as usize;
+        Ok(pagebuf_get_buf!(page, LEAF_KEY, klen))
+    } else {
+        Err(RmdbError::InvalidMetadata)
+    }
+}
+
+/* page here must be only the payload, not the raw page,
+   page.len() MUST be == self.pagesize */
 fn get_leaf(mmap: &[u8], pagesize: usize, pagenum: u64, key: &[u8])
         -> Result<u64, RmdbError> {
     let page = page_get_payload!(mmap, pagesize, pagenum);
@@ -750,13 +756,10 @@ fn get_leaf(mmap: &[u8], pagesize: usize, pagenum: u64, key: &[u8])
         return Err(RmdbError::KeyNotFound);
     }
     /* TODO: change to a bisect */
-    let idx = page.len() - 2 * nptrs;
     let mut node = 0u64;
-    for n in 0..nptrs {
-        let ptr = pagebuf_get_int!(u16, page, idx + (n * 2)) as usize;
-        let len = pagebuf_get_int!(u16, page, ptr + 8) as usize;
-        let pkey = &page[(ptr + 10)..(ptr + 10 + len)];
-        node = pagebuf_get_int!(u64, page, ptr);
+    for n in (0..nptrs).rev() {
+        node = pagebuf_get_int!(u64, page, NODE_FIRSTPTR + n * 8);
+        let pkey = get_leaf_key(mmap, node)?;
         if key >= pkey {
             return get_leaf(mmap, pagesize, node, key);
         }
@@ -1031,11 +1034,10 @@ impl RmdbWTxn<'_> {
             return Err(RmdbError::KeyNotFound);
         }
         for n in 0..nptrs {
-            let idx = self.pagesize - KEYIDX_SIZE * (n + 1);
-            let ptr = pagebuf_get_int!(u16, page, idx) as usize;
-            let pageptr = pagebuf_get_int!(u64, page, ptr);
+            let idx = NODE_FIRSTPTR + n * 8;
+            let pageptr = pagebuf_get_int!(u64, page, idx);
             if pageptr == curptr {
-                pagebuf_set_int!(u64, &mut page, ptr, newptr);
+                pagebuf_set_int!(u64, &mut page, idx, newptr);
                 return Ok(());
             }
         }
@@ -1093,6 +1095,7 @@ impl RmdbWTxn<'_> {
     }
 
     /* FIXME: this adds only one leaf directly to the parent, no layering */
+    /* FIXME: remove key parameter, get from leaf */
     fn add_page(&mut self, rootpage: u64, leaf: u64, key: &[u8])
             -> Result<(), RmdbError> {
         let mut parent = rootpage;
@@ -1102,63 +1105,54 @@ impl RmdbWTxn<'_> {
             self.mark_dirty(parent);
             self.delete_page(rootpage)?;
         }
-        let page = page_get_payload!(mut, self.wmap, self.pagesize, parent);
+
+        /* get page as immutable until we need to make changes */
+        let page = page_get_payload!(self.wmap, self.pagesize, parent);
 
         /* check if enough space in page to add key */
         let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
-        /* find highest index */
-        let idx = self.pagesize - 2 * nptrs;
-        let mut floor = NODE_FIRSTPTR;
-        if nptrs > 0 {
-            let mut hptr = NODE_FIRSTPTR;
-            for n in 0..nptrs {
-                let ptr = pagebuf_get_int!(u16, page, idx + (2 * n)) as usize;
-                if ptr > hptr {
-                    hptr = ptr;
-                }
-            };
-            /* get keylen of last key */
-            let len = pagebuf_get_int!(u16, page, hptr + 8) as usize;
-            /* get floor aligned to u64 */
-            floor = align!(u64, (hptr + 10 + len));
-        }
-        let ceil = self.pagesize - 2 * nptrs;
-        if ceil - floor < PAGEPTR_SIZE + 2 + key.len() + KEYIDX_SIZE {
+        let topptr = NODE_FIRSTPTR + nptrs * PAGEPTR_SIZE;
+        if topptr + PAGEPTR_SIZE > self.pagesize {
             //TODO: split tree and add nodes
             return Err(RmdbError::InvalidDataSize);
         }
 
-        /* add key slot */
-        pagebuf_set_int!(u64, page, floor, leaf);
-        pagebuf_set_int!(u16, page, floor + PAGEPTR_SIZE, key.len() as u16);
-        pagebuf_set_buf!(page, floor + PAGEPTR_SIZE + 2, key);
-
-        /* add key to index */
-        let mut idx = self.pagesize - 2 * nptrs;
-        for _ in 0..nptrs {
-            let ptr = pagebuf_get_int!(u16, page, idx) as usize;
-            let len = pagebuf_get_int!(u16, page, ptr + 8) as usize;
-            let pkey = &page[(ptr + 10)..(ptr + 10 + len)];
+        /* add leaf to index */
+        let mut idx = NODE_FIRSTPTR + nptrs * PAGEPTR_SIZE;
+        for n in (0..nptrs).rev() {
+            idx = NODE_FIRSTPTR + n * 8;
+            let node = pagebuf_get_int!(u64, page, idx);
+            let pkey = get_leaf_key(&self.wmap, node)?;
             if key == pkey {
                 return Err(RmdbError::InvalidMetadata);
             }
             if key > pkey {
+                idx += 8;
                 break;
             }
-            idx += 2;
         }
+
         /* we found the insertion point, add key index here, and move,
          * all other upwards */
-        let mptrs = nptrs - (self.pagesize - idx) / 2;
-        idx -= 2;
+
+        /* get again page as mutuable now to make changes */
+        let page = page_get_payload!(mut, self.wmap, self.pagesize, parent);
+
+        let mptrs = (topptr - idx) / 8;
+
         /* ignored if we are operating on the highest slot */
-        let mut lptr = pagebuf_get_int!(u16, page, idx);
-        pagebuf_set_int!(u16, page, idx, floor as u16);
+        let mut savedptr = pagebuf_get_int!(u64, page, idx);
+
+        /* set new in slot */
+        pagebuf_set_int!(u64, page, idx, leaf);
+
+        /* move all others up if any */
+        idx += 8;
         for _ in 0..mptrs {
-            idx -= 2;
-            let hptr = pagebuf_get_int!(u16, page, idx);
-            pagebuf_set_int!(u16, page, idx, lptr);
-            lptr = hptr;
+            let curptr = pagebuf_get_int!(u64, page, idx);
+            pagebuf_set_int!(u64, page, idx, savedptr);
+            savedptr = curptr;
+            idx += 8;
         }
 
         pagebuf_set_int!(u32, page, NODE_NUMPTRS, nptrs as u32 + 1);
