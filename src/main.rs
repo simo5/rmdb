@@ -2,6 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use std::time;
 
 use rmdb::Rmdb;
 use rmdb::RmdbFlags;
@@ -43,13 +44,21 @@ fn main() {
                 let key = format!("test{}", t);
                 let value = format!("value{}", t);
                 txn.add_entry(key.as_bytes(), value.as_bytes()).unwrap();
+                println!("Written '{}' from thread {}", key, t);
                 txn.commit(&*rmdb).unwrap();
             } else {
+                thread::sleep(time::Duration::from_secs(1));
                 let txn = rmdb.get_read_transaction().unwrap();
-                let key = format!("test{}", t - 1);
-                let value = txn.get_entry(key.as_bytes()).unwrap();
-                println!("Value '{}' from thread {}",
-                         std::str::from_utf8(&value[0]).unwrap(), t);
+                let key = format!("test{}", 9 - t);
+                match txn.get_entry(key.as_bytes()) {
+                    Ok(value) => {
+                        println!("Value '{}' from thread {}",
+                            std::str::from_utf8(&value[0]).unwrap(), t);
+                    },
+                    Err(error) => {
+                        println!("Error '{}' from thread {}", error, t);
+                    }
+                };
             }
         });
         handles.push(handle);
@@ -57,5 +66,13 @@ fn main() {
 
     for handle in handles {
         handle.join().unwrap();
+    }
+
+    let txn = rmdb.get_read_transaction().unwrap();
+    for i in [0,2,4,6,8].iter() {
+        let key = format!("test{}", i);
+        let value = txn.get_entry(key.as_bytes()).unwrap();
+        println!("Key/Value = {}/{}", key,
+            std::str::from_utf8(&value[0]).unwrap());
     }
 }
