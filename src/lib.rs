@@ -1047,7 +1047,7 @@ impl RmdbWTxn<'_> {
             if end > self.pagesize {
                 end = self.pagesize;
             }
-            pagebuf_set_buf!(&mut data, 0, &value[start..end]);
+            pagebuf_set_buf!(&mut data, 0, &value[start..(start + end)]);
             start += end;
         }
 

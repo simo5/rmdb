@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time;
 
+use openssl::rand::rand_bytes;
+
 use rmdb::Rmdb;
 use rmdb::RmdbFlags;
 use rmdb::RmdbOptions;
@@ -17,12 +19,19 @@ fn db_filename(sname: &str) -> String {
     String::from(sname)
 }
 
+fn get_rand_val(fill: u8) -> Vec<u8> {
+    let mut r = [0; 2];
+    rand_bytes(&mut r).unwrap();
+    let size = u16::from_le_bytes(r) as usize;
+    vec![fill; size]
+}
+
 fn test(name: String, opt: Option<RmdbOptions>) {
 
     let rmdb = Arc::new(Rmdb::create(PathBuf::from(name.clone()), opt).unwrap());
     let mut txn = rmdb.get_write_transaction().unwrap();
 
-    let result = txn.add_entry(b"test", b"value");
+    let result = txn.add_entry(b"test", &get_rand_val(b'v'));
     match result {
         Ok(()) => (),
         Err(error) => {
@@ -96,8 +105,8 @@ fn main() {
 
     /* use no integrity and no flush, also small pagesize and db size */
     let opt =  Some(*RmdbOptions::new()
-                                  .pagesize(512)
-                                  .initial_size(512*48)
+                                  .pagesize(1024)
+                                  .initial_size(1024 * 100)
                                   .flags(RmdbFlags::empty()));
     test(name, opt);
 }
