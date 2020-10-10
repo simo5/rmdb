@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -6,6 +7,7 @@ use std::time;
 
 use rmdb::Rmdb;
 use rmdb::RmdbFlags;
+use rmdb::RmdbOptions;
 
 fn db_filename(sname: &str) -> String {
     let args: Vec<String> = env::args().collect();
@@ -15,11 +17,9 @@ fn db_filename(sname: &str) -> String {
     String::from(sname)
 }
 
-fn main() {
+fn test(name: String, opt: Option<RmdbOptions>) {
 
-    let name = db_filename("test1db.rmdb");
-    let flags = <RmdbFlags as Default>::default() | RmdbFlags::PAGE_INTEGRITY;
-    let rmdb = Arc::new(Rmdb::open(PathBuf::from(name), flags, true).unwrap());
+    let rmdb = Arc::new(Rmdb::create(PathBuf::from(name.clone()), opt).unwrap());
     let mut txn = rmdb.get_write_transaction().unwrap();
 
     let result = txn.add_entry(b"test", b"value");
@@ -34,6 +34,10 @@ fn main() {
     println!("Value = {}", std::str::from_utf8(&value[0]).unwrap());
     txn.commit(&*rmdb).unwrap();
     drop(txn);
+    drop(rmdb);
+
+    /* reopen */
+    let rmdb = Arc::new(Rmdb::open(PathBuf::from(name)).unwrap());
 
     let mut handles = vec![];
     for t in 0..10 {
@@ -75,4 +79,25 @@ fn main() {
         println!("Key/Value = {}/{}", key,
             std::str::from_utf8(&value[0]).unwrap());
     }
+}
+
+fn main() {
+
+    let name = db_filename("test1db.rmdb");
+    /* remove file if exist, ignore errors */
+    let _ = fs::remove_file(name.as_str());
+
+    /* use default flags */
+    test(name, None);
+
+    let name = db_filename("test2db.rmdb");
+    /* remove file if exist, ignore errors */
+    let _ = fs::remove_file(name.as_str());
+
+    /* use no integrity and no flush, also small pagesize and db size */
+    let opt =  Some(*RmdbOptions::new()
+                                  .pagesize(512)
+                                  .initial_size(512*48)
+                                  .flags(RmdbFlags::empty()));
+    test(name, opt);
 }
