@@ -129,8 +129,8 @@ const PAGEPTR_SIZE: usize = 8;   // u64
  *   .................................
  *
  * The number of aditional pages is
- * dependent on DATALEN.
- * DATALEN/RAWPAGESIZE = #PAGES
+ * dependent on DATASIZE.
+ * DATASIZE/RAWPAGESIZE = #PAGES
  * Part or all of the content may also
  * be contained directly in the Leaf
  * page in the DATA section.
@@ -148,6 +148,8 @@ const LEAF_KEY:      usize = 16; // [u8]
 pub enum RmdbError {
     InvalidDataSize,
     KeyNotFound,
+    KeyNotHere,
+    PageNotLeaf,
     InvalidMetadata,
     UnalignedAccess,
     LockError,
@@ -172,6 +174,8 @@ impl fmt::Display for RmdbError {
             RmdbError::UnalignedAccess => write!(f, "Unaligned Access Request"),
             RmdbError::InvalidMetadata => write!(f, "Invalid metadata"),
             RmdbError::KeyNotFound => write!(f, "Key not found"),
+            RmdbError::KeyNotHere => write!(f, "Key not in this (sub)tree"),
+            RmdbError::PageNotLeaf => write!(f, "Page is not a leaf"),
             RmdbError::InvalidDataSize => write!(f, "Invalid data size"),
         }
     }
@@ -190,6 +194,8 @@ impl Error for RmdbError {
             RmdbError::UnalignedAccess => None,
             RmdbError::InvalidMetadata => None,
             RmdbError::KeyNotFound => None,
+            RmdbError::KeyNotHere => None,
+            RmdbError::PageNotLeaf => None,
             RmdbError::InvalidDataSize => None,
         }
     }
@@ -799,45 +805,97 @@ impl<'a> RmdbFetch<'a> {
             let klen = pagebuf_get_int!(u16, page, LEAF_KEYLEN) as usize;
             Ok(pagebuf_get_buf!(page, LEAF_KEY, klen))
         } else {
-            Err(RmdbError::InvalidMetadata)
+            Err(RmdbError::PageNotLeaf)
         }
     }
 
-    /* page here must be only the payload, not the raw page,
-       page.len() MUST be == self.payload */
-    fn get_leaf(&self, pagenum: u64, key: &[u8]) -> Result<u64, RmdbError> {
+    /* pagenum must be a node page */
+    fn get_parents_leaf(&self, pagenum: u64, key: &[u8])
+                       -> Result<(Vec<u64>, u64), RmdbError> {
+        let mut parents = Vec::new();
         let page = page_get_payload!(self, self.mmap, pagenum);
         let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
-        if ptype & PAGE_LEAF == PAGE_LEAF {
-            /* check we got the right leaf */
-            let klen = pagebuf_get_int!(u16, page, LEAF_KEYLEN) as usize;
-            if key.len() != klen {
-                return Err(RmdbError::KeyNotFound);
-            }
-            if key != &page[LEAF_KEY..(LEAF_KEY + klen)] {
-                return Err(RmdbError::KeyNotFound);
-            }
-            return Ok(pagenum);
-        }
         if ptype & PAGE_NODE != PAGE_NODE {
             return Err(RmdbError::InvalidMetadata);
         }
         let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
         if nptrs == 0 {
-            return Err(RmdbError::KeyNotFound);
+            return Err(RmdbError::KeyNotHere);
         }
+
+        parents.push(pagenum);
+
         /* TODO: change to a bisect */
-        let mut node = 0u64;
-        for n in (0..nptrs).rev() {
-            node = pagebuf_get_int!(u64, page, NODE_FIRSTPTR + n * 8);
-            let pkey = self.get_leaf_key(node)?;
-            if key >= pkey {
-                return self.get_leaf(node, key);
-            }
+        for n in 0..nptrs {
+            let pageptr = pagebuf_get_int!(u64, page, NODE_FIRSTPTR + n * 8);
+            match self.get_leaf_key(pageptr) {
+                Ok(pkey) => {
+                    if key == pkey {
+                        return Ok((parents, pageptr));
+                    }
+                    if key < pkey {
+                        /* key not found, and found pkey is larger, so this
+                         * node would be the likely parent, of a child with
+                         * the requested key */
+                        return Ok((parents, 0));
+                    }
+                },
+                Err(error) => {
+                    /* PageNotLeaf means this is a node of nodes */
+                    match error {
+                        RmdbError::PageNotLeaf => (),
+                        _ => return Err(error),
+                    };
+                    match self.get_parents_leaf(pageptr, key) {
+                        Ok((mut par, leaf)) => {
+                            while let Some(val) = par.pop() {
+                                parents.push(val)
+                            }
+                            return Ok((parents, leaf));
+                        },
+                        Err(error) => {
+                            /* KeyNotHere menas continue with loop */
+                            match error {
+                                RmdbError::KeyNotHere => (),
+                                _ => return Err(error),
+                            };
+                        },
+                    };
+                },
+            };
         }
-        /* not found, return lowmost index node,
-         * the last in the loop */
-        return self.get_leaf(node, key);
+        /* if we get here it means we scanned all keys in this (sub)tree and
+         * found the key is bigger than biggest stored key.
+         * return KeyNotHere iwhich ndicates that key could be found in the
+         * next parent's subtree */
+        return Err(RmdbError::KeyNotHere);
+    }
+
+    fn get_parents(&self, pagenum: u64, key: &[u8])
+                   -> Result<Vec<u64>, RmdbError> {
+        match self.get_parents_leaf(pagenum, key) {
+            Ok((parents, _leaf)) => Ok(parents),
+            Err(error) => match error {
+                RmdbError::KeyNotHere => Ok(vec![pagenum]),
+                _ => Err(error),
+            },
+        }
+    }
+
+    fn get_leaf(&self, pagenum: u64, key: &[u8]) -> Result<u64, RmdbError> {
+        match self.get_parents_leaf(pagenum, key) {
+            Ok((_parents, leaf)) => {
+                if leaf != 0 {
+                    Ok(leaf)
+                } else {
+                    Err(RmdbError::KeyNotFound)
+                }
+            },
+            Err(error) => match error {
+                RmdbError::KeyNotHere => Err(RmdbError::KeyNotFound),
+                _ => Err(error),
+            },
+        }
     }
 }
 
@@ -1070,10 +1128,10 @@ impl RmdbWTxn<'_> {
 
         if cur_leaf == 0 {
             // adding a new key/value
-            self.add_page(rootpage, leaf, key)?;
+            self.add_leaf(rootpage, leaf, key)?;
         } else {
             // we are replacing a leaf
-            self.replace_page(rootpage, cur_leaf, leaf)?;
+            self.replace_leaf(rootpage, cur_leaf, leaf)?;
         }
 
         Ok(())
@@ -1147,7 +1205,7 @@ impl RmdbWTxn<'_> {
     }
 
     /* FIXME: this replaces only one leaf directly to the parent, no layering */
-    fn replace_page(&mut self, oldparent: u64, curchild: u64, newchild: u64)
+    fn replace_leaf(&mut self, oldparent: u64, curchild: u64, newchild: u64)
             -> Result<(), RmdbError> {
         let mut parent = oldparent;
         let page = page_get_payload!(self, self.wmap, parent);
@@ -1168,13 +1226,13 @@ impl RmdbWTxn<'_> {
         Ok(())
     }
 
-    /* FIXME: this adds only one leaf directly to the parent, no layering */
-    /* FIXME: remove key parameter, get from leaf */
-    fn add_page(&mut self, rootpage: u64, leaf: u64, key: &[u8])
+    fn add_leaf(&mut self, rootpage: u64, leaf: u64, key: &[u8])
             -> Result<(), RmdbError> {
-        let mut parent = rootpage;
+        let fetch = RmdbFetch::new(self.flags, self.pagesize, self.payload,
+                                   &self.wmap);
+        let mut parents = fetch.get_parents(rootpage, key)?;
+        let mut parent = parents.pop().unwrap();
 
-        /* get page as immutable until we need to make changes */
         let page = page_get_payload!(self, self.wmap, parent);
         let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
         if ptype & PAGE_DIRTY == 0 {
@@ -1186,12 +1244,10 @@ impl RmdbWTxn<'_> {
         /* fetch page again as it may have changed */
         let page = page_get_payload!(self, self.wmap, parent);
 
-        /* check if enough space in page to add key */
         let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
         let topptr = NODE_FIRSTPTR + nptrs * PAGEPTR_SIZE;
         if topptr + PAGEPTR_SIZE > self.payload {
-            //TODO: split tree and add nodes
-            return Err(RmdbError::InvalidDataSize);
+            return Err(RmdbError::InvalidMetadata)
         }
 
         /* add leaf to index */
