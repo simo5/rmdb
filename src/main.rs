@@ -19,10 +19,10 @@ fn db_filename(sname: &str) -> String {
     String::from(sname)
 }
 
-fn get_rand_val(fill: u8) -> Vec<u8> {
+fn get_rand_val(fill: u8, maxsize: usize) -> Vec<u8> {
     let mut r = [0; 2];
     rand_bytes(&mut r).unwrap();
-    let size = u16::from_le_bytes(r) as usize;
+    let size = u16::from_le_bytes(r) as usize % maxsize;
     vec![fill; size]
 }
 
@@ -31,7 +31,7 @@ fn test(name: String, opt: Option<RmdbOptions>) {
     let rmdb = Arc::new(Rmdb::create(PathBuf::from(name.clone()), opt).unwrap());
     let mut txn = rmdb.get_write_transaction().unwrap();
 
-    let result = txn.add_entry(b"test", &get_rand_val(b'v'));
+    let result = txn.add_entry(b"test", &get_rand_val(b'v', 65536));
     match result {
         Ok(()) => (),
         Err(error) => {
@@ -90,6 +90,45 @@ fn test(name: String, opt: Option<RmdbOptions>) {
     }
 }
 
+fn testload(name: String, opt: Option<RmdbOptions>,
+            num: usize, vsize: usize) {
+
+    let rmdb = Rmdb::create(PathBuf::from(name.clone()), opt).unwrap();
+    let mut txn = rmdb.get_write_transaction().unwrap();
+
+    println!("Adding {} test records", num);
+
+    for i in 0..num {
+        let key = format!("test{}", i);
+        let value = get_rand_val(b'v', vsize);
+        let result = txn.add_entry(key.as_bytes(), &value);
+        match result {
+            Ok(()) => {
+                println!("Added Key {} with value length {}",
+                         key, value.len());
+            },
+            Err(error) => {
+                println!("Adding Key {} with value length {}, got {}",
+                         key, value.len(), error);
+            },
+        };
+    }
+    txn.commit(&rmdb).unwrap();
+    drop(txn);
+
+    let txn = rmdb.get_read_transaction().unwrap();
+    for i in 0..num {
+        let key = format!("test{}", i);
+        let result = txn.get_entry(key.as_bytes());
+        match result {
+            Ok(_val) => (),
+            Err(error) => {
+                println!("Reading Key {} got {}", key, error);
+            },
+        };
+    }
+}
+
 fn main() {
 
     let name = db_filename("test1db.rmdb");
@@ -109,4 +148,15 @@ fn main() {
                                   .initial_size(1024 * 100)
                                   .flags(RmdbFlags::empty()));
     test(name, opt);
+
+    let name = db_filename("test3db.rmdb");
+    /* remove file if exist, ignore errors */
+    let _ = fs::remove_file(name.as_str());
+
+    /* smallest page size then fill db with more leaves than a single
+     * node can hold */
+    let opt =  Some(*RmdbOptions::new()
+                                  .pagesize(256)
+                                  .initial_size(1024 * 4096));
+    testload(name, opt, 64, 1024);
 }
