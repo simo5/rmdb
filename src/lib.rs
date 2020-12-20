@@ -1102,10 +1102,42 @@ impl RmdbWTxn<'_> {
         Ok(())
     }
 
+    pub fn del_entry(&mut self, key: &[u8]) -> Result<(), RmdbError> {
+        if self.rootpage == 0 {
+            return Err(RmdbError::KeyNotFound);
+        }
+        let fetch = RmdbFetch::new(self.flags, self.pagesize, self.payload,
+                                   &self.wmap);
+        let result = fetch.get_parents_leaf(self.rootpage, key);
+        let (mut parents, leaf) = match result {
+            Ok((parents, leaf)) => {
+                if leaf != 0 {
+                    (parents, leaf)
+                } else {
+                    return Err(RmdbError::KeyNotFound)
+                }
+            },
+            Err(error) => match error {
+                RmdbError::KeyNotHere => return Err(RmdbError::KeyNotFound),
+                _ => return Err(error),
+            },
+        };
+        self.del_leaf(&mut parents, leaf)
+    }
+
     fn delete_page(&mut self, pagenum: u64) {
         /* remove it from dirty-pages if there */
         self.dirtypages.retain(|&x| x != pagenum);
-        self.deletepages.push(pagenum);
+
+        let page = page_get_payload!(self, self.wmap, pagenum);
+        let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+        if (ptype & PAGE_DIRTY) == PAGE_DIRTY {
+            /* if dirty return immediately to free pages */
+            self.put_free_pages([pagenum].to_vec()).unwrap();
+        } else {
+            /* otherwise mark for deletion on commit */
+            self.deletepages.push(pagenum);
+        }
     }
 
     fn replace_childptr(&mut self, parent: u64, curptr: u64, newptr: u64)
@@ -1418,6 +1450,55 @@ impl RmdbWTxn<'_> {
 
         pagebuf_set_int!(u32, page, NODE_NUMPTRS, nptrs as u32 + 1);
 
+        Ok(())
+    }
+
+    fn del_leaf(&mut self, parents: &mut Vec<u64>, leaf: u64)
+            -> Result<(), RmdbError> {
+
+        let mut parent = match parents.pop() {
+            Some(parent) => parent,
+            None => return Err(RmdbError::InvalidMetadata),
+        };
+        let page = page_get_payload!(self, self.wmap, parent);
+        let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+        let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
+        if nptrs == 1 && parent != self.rootpage {
+            /* last leaf of node, remove parent as well */
+            self.del_leaf(parents, parent)?;
+            self.delete_page(leaf);
+            return Ok(());
+        } else {
+            if ptype & PAGE_DIRTY != PAGE_DIRTY {
+                /* page not dirty, we must Copy on Write */
+                parent = self.replace_node(parents, parent)?;
+            }
+        }
+
+        /* re-read parent, may have changed */
+        let page = page_get_payload!(mut, self, self.wmap, parent);
+
+        /* remove leaf from index */
+        let mut loc = 0usize;
+        /* TODO: use bisection */
+        for n in 0..nptrs {
+            let idx = NODE_FIRSTPTR + n * PAGEPTR_SIZE;
+            let node = pagebuf_get_int!(u64, page, idx);
+            if node == leaf {
+                loc = n;
+                break;
+            }
+        }
+        /* found insertion point, copy the rest one over */
+        loc += 1;
+        for n in loc..nptrs {
+            let idx = NODE_FIRSTPTR + n * PAGEPTR_SIZE;
+            let node = pagebuf_get_int!(u64, page, idx);
+            pagebuf_set_int!(u64, page, idx - 8, node);
+        }
+        /* update size */
+        pagebuf_set_int!(u32, page, NODE_NUMPTRS, (nptrs - 1) as u32);
+        self.delete_page(leaf);
         Ok(())
     }
 

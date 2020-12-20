@@ -91,7 +91,7 @@ fn test(name: String, opt: Option<RmdbOptions>) {
 }
 
 fn testload(name: String, opt: Option<RmdbOptions>,
-            num: usize, vsize: usize) {
+            num: usize, vsize: usize, delete: bool) {
 
     let rmdb = Rmdb::create(PathBuf::from(name.clone()), opt).unwrap();
     let mut txn = rmdb.get_write_transaction().unwrap();
@@ -103,10 +103,7 @@ fn testload(name: String, opt: Option<RmdbOptions>,
         let value = get_rand_val(b'v', vsize);
         let result = txn.add_entry(key.as_bytes(), &value);
         match result {
-            Ok(()) => {
-                println!("Added Key {} with value length {}",
-                         key, value.len());
-            },
+            Ok(()) => (),
             Err(error) => {
                 println!("Adding Key {} with value length {}, got {}",
                          key, value.len(), error);
@@ -126,6 +123,21 @@ fn testload(name: String, opt: Option<RmdbOptions>,
                 println!("Reading Key {} got {}", key, error);
             },
         };
+    }
+    drop(txn);
+
+    if delete {
+        let mut txn = rmdb.get_write_transaction().unwrap();
+        for i in 0..num {
+            let key = format!("test{}", i);
+            let result = txn.del_entry(key.as_bytes());
+            match result {
+                Ok(_val) => (),
+                Err(error) => {
+                    println!("Deleting Key {} got {}", key, error);
+                },
+            };
+        }
     }
 }
 
@@ -158,5 +170,16 @@ fn main() {
     let opt =  Some(*RmdbOptions::new()
                                   .pagesize(256)
                                   .initial_size(1024 * 4096));
-    testload(name, opt, 64, 1024);
+    testload(name, opt, 64, 1024, false);
+
+    let name = db_filename("test4db.rmdb");
+    /* remove file if exist, ignore errors */
+    let _ = fs::remove_file(name.as_str());
+
+    /* smallest page size then fill db with more leaves than a single
+     * node can hold */
+    let opt =  Some(*RmdbOptions::new()
+                                  .pagesize(256)
+                                  .initial_size(1024 * 4096));
+    testload(name, opt, 64, 1024, true);
 }
