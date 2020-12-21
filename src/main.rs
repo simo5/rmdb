@@ -176,10 +176,7 @@ fn main() {
     /* remove file if exist, ignore errors */
     let _ = fs::remove_file(name.as_str());
 
-    /* smallest page size then fill db with more leaves than a single
-     * node can hold */
-    let opt =  Some(*RmdbOptions::new()
-                                  .pagesize(256)
-                                  .initial_size(1024 * 4096));
-    testload(name, opt, 64, 1024, true);
+    /* More, entries, delete entries, enough entries to cause db growth */
+    let opt =  Some(*RmdbOptions::new().pagesize(128).initial_size(128*64));
+    testload(name, opt, 1024, 512, true);
 }
