@@ -41,7 +41,7 @@ fn test(name: String, opt: Option<RmdbOptions>) {
     };
     let value = txn.get_entry(b"test").unwrap();
     println!("Value = {}", std::str::from_utf8(&value[0]).unwrap());
-    txn.commit(&*rmdb).unwrap();
+    txn.commit().unwrap();
     drop(txn);
     drop(rmdb);
 
@@ -58,7 +58,7 @@ fn test(name: String, opt: Option<RmdbOptions>) {
                 let value = format!("value{}", t);
                 txn.add_entry(key.as_bytes(), value.as_bytes()).unwrap();
                 println!("Written '{}' from thread {}", key, t);
-                txn.commit(&*rmdb).unwrap();
+                txn.commit().unwrap();
             } else {
                 thread::sleep(time::Duration::from_secs(1));
                 let txn = rmdb.get_read_transaction().unwrap();
@@ -110,7 +110,7 @@ fn testload(name: String, opt: Option<RmdbOptions>,
             },
         };
     }
-    txn.commit(&rmdb).unwrap();
+    txn.commit().unwrap();
     drop(txn);
 
     let txn = rmdb.get_read_transaction().unwrap();
