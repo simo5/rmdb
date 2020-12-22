@@ -767,34 +767,37 @@ impl<'a> RmdbFetch<'a> {
     }
 
     /* pagenum must be a node page */
-    fn get_parents_leaf(&self, pagenum: u64, key: &[u8])
-                       -> Result<(Vec<u64>, u64), RmdbError> {
-        let mut parents = Vec::new();
+    fn get_parents_leaf(&self, pagenum: u64, key: &[u8],
+                        parents: &mut Vec<u64>) -> Result<u64, RmdbError> {
         let page = page_get_payload!(self.rmdb, self.mmap, pagenum);
         let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
         if ptype & PAGE_NODE != PAGE_NODE {
             return Err(RmdbError::InvalidMetadata);
         }
+        parents.push(pagenum);
+        let parents_size = parents.len();
+
         let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
         if nptrs == 0 {
             return Err(RmdbError::KeyNotHere);
         }
 
-        parents.push(pagenum);
-
         /* TODO: change to a bisect */
         for n in 0..nptrs {
+            /* if we are looping again, truncate any value aprevious branch
+             * may have added */
+            parents.truncate(parents_size);
             let pageptr = pagebuf_get_int!(u64, page, NODE_FIRSTPTR + n * 8);
             match self.get_leaf_key(pageptr) {
                 Ok(pkey) => {
                     if key == pkey {
-                        return Ok((parents, pageptr));
+                        return Ok(pageptr);
                     }
                     if key < pkey {
                         /* key not found, and found pkey is larger, so this
                          * node would be the likely parent, of a child with
                          * the requested key */
-                        return Ok((parents, 0));
+                        return Ok(0);
                     }
                 },
                 Err(error) => {
@@ -803,10 +806,9 @@ impl<'a> RmdbFetch<'a> {
                         RmdbError::PageNotLeaf => (),
                         _ => return Err(error),
                     };
-                    match self.get_parents_leaf(pageptr, key) {
-                        Ok((mut par, leaf)) => {
-                            parents.append(&mut par);
-                            return Ok((parents, leaf));
+                    match self.get_parents_leaf(pageptr, key, parents) {
+                        Ok(leaf) => {
+                            return Ok(leaf);
                         },
                         Err(error) => {
                             /* KeyNotHere means continue with loop */
@@ -828,18 +830,20 @@ impl<'a> RmdbFetch<'a> {
 
     fn get_parents(&self, pagenum: u64, key: &[u8])
                    -> Result<Vec<u64>, RmdbError> {
-        match self.get_parents_leaf(pagenum, key) {
-            Ok((parents, _leaf)) => Ok(parents),
+        let mut parents = Vec::new();
+        match self.get_parents_leaf(pagenum, key, &mut parents) {
+            Ok(_leaf) => Ok(parents),
             Err(error) => match error {
-                RmdbError::KeyNotHere => Ok(vec![pagenum]),
+                RmdbError::KeyNotHere => Ok(parents),
                 _ => Err(error),
             },
         }
     }
 
     fn get_leaf(&self, pagenum: u64, key: &[u8]) -> Result<u64, RmdbError> {
-        match self.get_parents_leaf(pagenum, key) {
-            Ok((_parents, leaf)) => {
+        let mut parents = Vec::new();
+        match self.get_parents_leaf(pagenum, key, &mut parents) {
+            Ok(leaf) => {
                 if leaf != 0 {
                     Ok(leaf)
                 } else {
@@ -1073,11 +1077,12 @@ impl RmdbWTxn<'_> {
             return Err(RmdbError::KeyNotFound);
         }
         let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap);
-        let result = fetch.get_parents_leaf(self.rootpage, key);
-        let (mut parents, leaf) = match result {
-            Ok((parents, leaf)) => {
+        let mut parents = Vec::new();
+        let result = fetch.get_parents_leaf(self.rootpage, key, &mut parents);
+        let leaf = match result {
+            Ok(leaf) => {
                 if leaf != 0 {
-                    (parents, leaf)
+                    leaf
                 } else {
                     return Err(RmdbError::KeyNotFound)
                 }
@@ -1377,7 +1382,7 @@ impl RmdbWTxn<'_> {
         for n in (0..nptrs).rev() {
             idx = NODE_FIRSTPTR + n * 8;
             let node = pagebuf_get_int!(u64, page, idx);
-            let pkey = fetch.get_leaf_key(node)?;
+            let pkey = fetch.get_leaf_key(node).unwrap();
             if key == pkey {
                 return Err(RmdbError::InvalidMetadata);
             }
