@@ -4,9 +4,14 @@ version = "0.1.0"
 authors = ["Simo Sorce <simo@redhat.com>"]
 edition = "2018"
 
+[[bench]]
+name = "benchmark"
+harness = false
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bencher = "0.1.5"
 bitflags = "^1.2.1"
 memmap = "0.7.0"
 openssl-sys = "0.9"
