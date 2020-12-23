@@ -33,8 +33,7 @@ const RMDB_INTGSIZE: usize = 32;
  *   |-------------------------------|
  * 2 |          ROOT PAGE            |
  *   |-------------------------------|
- * 3 |   POINTERS TO FREE PAGES      |
- * . |-------------------------------|
+ * 3 |   EMPTY SPACE                 |
  * . .   ...                         .
  * . .                               .
  *   |--------------------------------
@@ -58,6 +57,20 @@ const PAGE_ROOT: u32 = 1u32 << 30;
 const PAGE_DIRTY: u32 = 1u32 << 31;
 
 /*
+ * Free pages are always allocated according to an algorithm dependent
+ * on the size of pages.
+ * The number of bits we can store in a freepage map is:
+ *  B = (payload - 8) * 8, where payload is pagesize - integrity (if any)
+ * So teh database is spliat in slices of size B * pagesize, and the free
+ * page for the area is always located at index * B * pagesize + 1.
+ *
+ * so for a 4k pagesize DB, B = 32576, and the second freepage is located
+ * at page 32576+1 (the first is always at page 1).
+ *
+ * the number of currently available freepages is always determined by the
+ * size of the DB, for the eample above if the DB is bigger than 132MiB then
+ * we have a second page allocated (32576 × 4096 = 133431296).
+ *
  * The free pages page has this structure:
  *   0              32              64
  *   ---------------------------------
@@ -500,7 +513,7 @@ impl Rmdb {
     fn setup(&mut self, flen: usize) -> Result<(), RmdbError> {
 
         /* Exclusive Access */
-        let wlock = self.wlock.lock().unwrap();
+        let mut wlock = self.wlock.lock().unwrap();
         let mut rlock = self.rlock.write().unwrap();
 
         /* check page 0 */
@@ -520,6 +533,7 @@ impl Rmdb {
                                 .try_into().unwrap())).unwrap();
         self.pagesize = pagebuf_get_int!(u32, rlock.mmap, RMDB_P_PAGESIZE) as usize;
         self.payload = payload_size(self.pagesize, self.flags);
+        wlock.num_pages = size_to_pages(self.pagesize, flen);
 
         if flen % self.pagesize != 0 {
             // corrupted, not a multiple of page size
@@ -617,6 +631,8 @@ impl Rmdb {
             rootpage: rootpage,
             dirtypages: Vec::new(),
             deletepages: Vec::new(),
+            freepages: Vec::new(),
+            freemapsize: self.payload - FREE_BITMAP,
         };
 
         Ok(txn)
@@ -872,7 +888,6 @@ impl RmdbTxn<'_> {
     }
 
     fn _scrub(&mut self) {
-        // TODO: something
         self.status = RmdbTxnState::Scrubbed
     }
 
@@ -901,51 +916,70 @@ pub struct RmdbWTxn<'a> {
     rmdb: &'a Rmdb,
     dirtypages: Vec<u64>,
     deletepages: Vec<u64>,
+    freepages: Vec<Vec<u8>>,
+    freemapsize: usize,
 }
 
 impl RmdbWTxn<'_> {
 
-    fn create_freepage(&mut self, fpidx:usize) -> Result<u64, RmdbError> {
-        let mapsize = self.rmdb.payload - FREE_BITMAP;
-        let pagenum = (mapsize * 8 * fpidx) as u64;
-        self.growdb(pagenum as u64)?;
+    fn growdb(&mut self, to_page: u64) -> Result<(), RmdbError> {
+        /* always grow by no less than 64 pages to avoid constant churn as
+         * pages are allocated piecemeal */
+        let pages = ((to_page + 63) / 64) * 64;
+        let size = (pages + 1) as usize * self.rmdb.pagesize;
+        let meta = self.rmdb.file.metadata()?;
+        let filelen = meta.len() as usize;
 
+        if size > filelen {
+            self.rmdb.file.set_len(size as u64)?;
+            self.wlock.num_pages = pages;
+            self.wlock.mmap = unsafe {
+                MmapMut::map_mut(&self.rmdb.file).map_err(RmdbError::Io)?
+            };
+        }
+        Ok(())
+    }
+
+    fn create_freepage(&mut self, pagenum: u64) -> Result<(), RmdbError> {
         let page = page_get_payload!(mut, self.rmdb, self.wlock.mmap, pagenum);
         pagebuf_set_int!(u32, page, FREE_PAGETYPE, PAGE_FREE);
+        let mapsize = self.rmdb.payload - FREE_BITMAP;
         let mut map = vec![u8::MAX; mapsize];
-        map[0] = map[0] >> 1; /* first page is taken by itself */
+        map[0] = 0b10111111; /* set at page 1 of block */
         pagebuf_set_buf!(page, FREE_BITMAP, &map);
-        self.mark_dirty(pagenum);
+        self.rmdb.integrity_protect(&mut self.wlock.mmap, pagenum)
+    }
 
-        let fpptr = RMDB_P_FREEPAGES + PAGEPTR_SIZE * fpidx;
-        pagebuf_set_int!(u64, self.wlock.mmap, fpptr, pagenum);
-
-        Ok(pagenum)
+    fn insure_free_page_copy(&mut self, fpidx: usize) {
+        if self.freepages.len() <= fpidx {
+            let fpnum = (self.freemapsize * 8 * fpidx) as u64 + 1;
+            let fpage = page_get_payload!(self.rmdb, self.wlock.mmap, fpnum);
+            let mut copy = fpage.to_vec();
+            pagebuf_set_int!(u32, copy, FREE_PAGETYPE, PAGE_FREE | PAGE_DIRTY);
+            self.freepages.push(copy);
+        }
     }
 
     fn get_free_pages(&mut self, n:usize) -> Result<Vec<u64>, RmdbError> {
-        // TODO: need to add support for multiple free page buffers
         let mut res = Vec::with_capacity(n);
         let mut left = n;
         let mut fpidx = 0usize;
 
         while left > 0 {
-            let fpptr = RMDB_P_FREEPAGES + PAGEPTR_SIZE * fpidx;
-            if fpptr >= self.rmdb.payload {
-                return Err(RmdbError::InvalidIndexSize)
-            }
-            let mut fpnum = pagebuf_get_int!(u64, self.wlock.mmap, fpptr);
-            if fpnum == 0 {
-                fpnum = self.create_freepage(fpidx)?;
+            let base = (self.freemapsize * 8 * fpidx) as u64;
+            let fpnum = base + 1;
+
+            if fpnum > self.wlock.num_pages {
+                self.growdb(fpnum)?;
+                self.create_freepage(fpnum)?;
             }
 
-            let fpage = page_get_payload!(mut, self.rmdb, self.wlock.mmap, fpnum);
-            let map = &mut fpage[FREE_BITMAP..self.rmdb.payload];
-            let mapsize = self.rmdb.payload - FREE_BITMAP;
-            let base = (mapsize * 8 * fpidx) as u64;
-            let mut r = 0usize;
+            self.insure_free_page_copy(fpidx);
+            let fpage = &mut self.freepages[fpidx];
+            let map = &mut fpage[FREE_BITMAP..self.freemapsize];
 
             //TODO: try to allocate consecutive blocks
+            let mut r = 0usize;
             for _ in 0..left {
                 'maploop:for i in 0..map.len() {
                     if map[i] != 0 {
@@ -953,7 +987,8 @@ impl RmdbWTxn<'_> {
                             let x = 0b10000000u8 >> j;
                             if map[i] & x == x {
                                 map[i] &= !x;
-                                res.push(base + (i * 8 + j) as u64);
+                                let allocated = base + (i * 8 + j) as u64;
+                                res.push(allocated);
                                 r += 1;
                                 break 'maploop;
                             }
@@ -963,7 +998,7 @@ impl RmdbWTxn<'_> {
             }
 
             if r > 0 {
-                self.mark_dirty(fpnum);
+                pagebuf_set_int!(u32, fpage, FREE_PAGETYPE, PAGE_FREE | PAGE_DIRTY);
                 left -= r;
             }
 
@@ -971,36 +1006,68 @@ impl RmdbWTxn<'_> {
         }
 
         if res.len() != n {
-            // FIXME: mark free again any pages in res
             return Err(RmdbError::InvalidIndexSize)
         }
-        //TODO: clear pages before returing them?
+        /* make sure we actually have file backing for newly allocated pages */
         self.growdb(*res.iter().max().unwrap())?;
+
+        //TODO: clear pages before returing them?
+        for a in 0..res.len() {
+            self.mark_dirty(res[a]);
+        }
+
         Ok(res)
     }
 
     fn put_free_pages(&mut self, pvec: Vec<u64>) -> Result<(), RmdbError> {
         let mut left = pvec.len();
         let mut fpidx = 0usize;
+
         while left > 0 {
-            let fpptr = RMDB_P_FREEPAGES + PAGEPTR_SIZE * fpidx;
-            let fpnum = pagebuf_get_int!(u64, self.wlock.mmap, fpptr);
-            let fpage = page_get_payload!(mut, self.rmdb, self.wlock.mmap, fpnum);
-            let map = &mut fpage[FREE_BITMAP..self.rmdb.payload];
-            let maxnum = fpnum + (map.len() * 8) as u64;
+            let dirty = false;
+            let base = (self.freemapsize * 8 * fpidx) as u64;
+            let max = base + (self.freemapsize * 8) as u64;
+            let fpnum = base + 1;
+
+            if fpnum > self.wlock.num_pages {
+                return Err(RmdbError::InvalidIndexSize)
+            }
+
+            self.insure_free_page_copy(fpidx);
+            let fpage = &mut self.freepages[fpidx];
+            let map = &mut fpage[FREE_BITMAP..self.freemapsize];
 
             for p in &pvec {
-                if *p > fpnum && *p < maxnum {
-                    let u = (*p / 8) as usize;
-                    let v = (*p % 8) as u8;
+                if *p >= base && *p < max {
+                    let q = *p - base;
+                    let u = (q / 8) as usize;
+                    let v = (q % 8) as u8;
                     let x = 0b10000000u8 >> v;
                     map[u] |= x;
                 }
                 left -= 1;
             }
+            if dirty {
+                pagebuf_set_int!(u32, fpage, FREE_PAGETYPE, PAGE_FREE | PAGE_DIRTY);
+            }
             fpidx += 1;
         }
         Ok(())
+    }
+
+    fn commit_free_pages(&mut self) {
+        for fpidx in 0..self.freepages.len() {
+            let fpnum = (self.freemapsize * 8 * fpidx) as u64 + 1;
+            let fpage = &mut self.freepages[fpidx];
+            let ptype = pagebuf_get_int!(u32, fpage, FREE_PAGETYPE);
+            if ptype & PAGE_DIRTY == PAGE_DIRTY {
+                let dbpage = page_get_payload!(mut, self.rmdb,
+                                               self.wlock.mmap, fpnum);
+                pagebuf_set_buf!(dbpage, 0, fpage);
+                self.mark_dirty(fpnum);
+            }
+        }
+        self.freepages.truncate(0);
     }
 
     pub fn get_entry(&mut self, key: &[u8]) -> Result<Vec<&[u8]>, RmdbError> {
@@ -1099,8 +1166,6 @@ impl RmdbWTxn<'_> {
             start += end;
         }
 
-        self.mark_dirty(leaf);
-
         /* then add them to the tree */
         let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap);
         let cur_leaf = fetch.get_leaf(self.rootpage, key);
@@ -1149,14 +1214,13 @@ impl RmdbWTxn<'_> {
     }
 
     fn delete_page(&mut self, pagenum: u64) {
-        /* remove it from dirty-pages if there */
-        self.dirtypages.retain(|&x| x != pagenum);
-
         let page = page_get_payload!(self.rmdb, self.wlock.mmap, pagenum);
         let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
         if (ptype & PAGE_DIRTY) == PAGE_DIRTY {
             /* if dirty return immediately to free pages */
             self.put_free_pages([pagenum].to_vec()).unwrap();
+            /* and remove from dirty pages */
+            self.dirtypages.retain(|&x| x != pagenum);
         } else {
             /* otherwise mark for deletion on commit */
             self.deletepages.push(pagenum);
@@ -1215,7 +1279,6 @@ impl RmdbWTxn<'_> {
     fn replace_node(&mut self, parents: &mut Vec<u64>, current: u64)
             -> Result<u64, RmdbError> {
         let newpage = self.get_new_page_copy(current)?;
-        self.mark_dirty(newpage);
         self.delete_page(current);
         if current == self.rootpage {
             self.rootpage = newpage;
@@ -1282,7 +1345,6 @@ impl RmdbWTxn<'_> {
                 pagebuf_set_int!(u32, &mut page, NODE_PAGETYPE,
                                  PAGE_NODE | PAGE_ROOT);
                 pagebuf_set_int!(u32, &mut page, NODE_NUMPTRS, 0u32);
-                self.mark_dirty(rootpage);
                 self.rootpage = rootpage;
                 rootpage
             },
@@ -1523,7 +1585,16 @@ impl RmdbWTxn<'_> {
     }
 
     fn _scrub(&mut self) {
-        self.status = RmdbTxnState::Scrubbed
+        self.status = RmdbTxnState::Scrubbed;
+        while let Some(page) = self.dirtypages.pop() {
+            drop(page);
+        }
+        while let Some(page) = self.deletepages.pop() {
+            drop(page);
+        }
+        while let Some(page) = self.freepages.pop() {
+            drop(page);
+        }
     }
 
     pub fn scrub(&mut self) -> Result<(), RmdbError> {
@@ -1550,9 +1621,11 @@ impl RmdbWTxn<'_> {
     }
 
     pub fn commit(&mut self) -> Result<(), RmdbError> {
-
         /* free deleted pages */
         self.put_free_pages(self.deletepages.to_vec())?;
+
+        /* call this before finalizing sirty pages as it adds there */
+        self.commit_free_pages();
 
         /* integrity check all dirty pages */
         let pages = self.dirtypages.to_vec();
@@ -1589,21 +1662,6 @@ impl RmdbWTxn<'_> {
         self.status = RmdbTxnState::Committed;
 
         drop(rlock);
-        Ok(())
-    }
-
-    fn growdb(&mut self, pages: u64) -> Result<(), RmdbError> {
-        let size = (pages + 1) as usize * self.rmdb.pagesize;
-        let meta = self.rmdb.file.metadata()?;
-        let filelen = meta.len() as usize;
-
-        if size > filelen {
-            self.rmdb.file.set_len(size as u64)?;
-            self.wlock.num_pages = pages;
-            self.wlock.mmap = unsafe {
-                MmapMut::map_mut(&self.rmdb.file).map_err(RmdbError::Io)?
-            };
-        }
         Ok(())
     }
 }
