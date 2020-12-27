@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use rmdb::Rmdb;
+use rmdb::RmdbFlags;
 use rmdb::RmdbOptions;
 
 #[macro_use]
@@ -12,7 +13,7 @@ use bencher::Bencher;
 fn testprep() -> (Rmdb, Vec<String>) {
 
     let name = String::from("bench1.rmdb");
-    let mut vec = Vec::with_capacity(512);
+    let mut vec = Vec::with_capacity(1024);
     for i in 0..vec.capacity() {
         let key = format!("test{}", i);
         vec.push(key);
@@ -20,14 +21,15 @@ fn testprep() -> (Rmdb, Vec<String>) {
     /* remove file if exist, ignore errors */
     let _ = fs::remove_file(name.as_str());
     let opt =  Some(*RmdbOptions::new()
-                                  .pagesize(512)
-                                  .initial_size(512 * 64));
+                                  .pagesize(1024)
+                                  .initial_size(1024 * 4096)
+                                  .flags(RmdbFlags::empty()));
     let rmdb = Rmdb::create(PathBuf::from(name.clone()), opt).unwrap();
     (rmdb, vec)
 }
 
 fn testadds(rmdb: &Rmdb, keys: &Vec<String>, commit: bool) {
-    let value = vec![b'v'; 1024];
+    let value = vec![b'v'; 2048];
     let mut txn = rmdb.get_write_transaction().unwrap();
 
     for i in 0..keys.len() {
