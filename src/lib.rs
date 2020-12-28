@@ -48,6 +48,7 @@ const RMDB_P_ROOT: usize = 16;      // u64
 const RMDB_P_FREEPAGES: usize = 24; // [u64]
 
 const POS_PAGETYPE: usize = 0;
+const POS_PAGEDATA: usize = 4;
 
 //const PAGE_NONE: u32 = 1u32 << 0;
 const PAGE_FREE: u32 = 1u32 << 1;
@@ -226,6 +227,7 @@ bitflags! {
         const PAGE_SYNC_FLUSH = 8;
         const TRANSACTION_FLUSH = 16;
         const TRANSACTION_SYNC_FLUSH = 32;
+        const ZERO_PAGES = 64;
     }
 }
 
@@ -1088,9 +1090,8 @@ impl RmdbWTxn<'_> {
         /* make sure we actually have file backing for newly allocated pages */
         self.growdb(*res.iter().max().unwrap())?;
 
-        //TODO: clear pages before returing them?
         for a in 0..res.len() {
-            self.mark_dirty(res[a]);
+            self.mark_dirty(res[a], true);
         }
 
         Ok(res)
@@ -1141,7 +1142,7 @@ impl RmdbWTxn<'_> {
                 let dbpage = page_get_payload!(mut, self.rmdb,
                                                self.wlock.mmap, fpnum);
                 pagebuf_set_buf!(dbpage, 0, fpage);
-                self.mark_dirty(fpnum);
+                self.mark_dirty(fpnum, false);
             }
         }
         self.freepages.truncate(0);
@@ -1338,13 +1339,18 @@ impl RmdbWTxn<'_> {
         Ok(copy)
     }
 
-    fn mark_dirty(&mut self, pagenum: u64) {
+    fn mark_dirty(&mut self, pagenum: u64, zeropage: bool) {
         let mut page = page_get_payload!(mut, self.rmdb, self.wlock.mmap, pagenum);
         let mut ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
         ptype |= PAGE_DIRTY;
         pagebuf_set_int!(u32, &mut page, POS_PAGETYPE, ptype);
         if ! self.dirtypages.contains(&pagenum) {
             self.dirtypages.push(pagenum);
+        }
+        if zeropage && self.rmdb.flags.contains(RmdbFlags::ZERO_PAGES) {
+            let mut zero: Vec<u8> = Vec::new();
+            zero.resize_with(page.len() - POS_PAGEDATA, Default::default);
+            pagebuf_set_buf!(page, POS_PAGEDATA, &zero);
         }
     }
 
