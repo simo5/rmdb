@@ -569,40 +569,6 @@ impl Rmdb {
         Ok(())
     }
 
-    pub fn growdb(&mut self, pages: u64) -> Result<(), RmdbError> {
-
-        let size = pages as usize * self.pagesize;
-        let meta = self.file.metadata()?;
-        let filelen = meta.len() as usize;
-
-        if size == filelen {
-            return Ok(())
-        }
-        if size < filelen {
-            return Err(RmdbError::InvalidFileSize)
-        }
-
-        if size < rmdb_minsize(self.pagesize) {
-            return Err(RmdbError::InvalidFileSize)
-        }
-
-        /* Exclusive Access */
-        let mut wlock = self.wlock.lock().unwrap();
-        let mut rlock = self.rlock.write().unwrap();
-
-        self.file.set_len(size as u64)?;
-        wlock.num_pages= pages;
-        wlock.mmap = unsafe {
-            MmapMut::map_mut(&self.file).map_err(RmdbError::Io)?
-        };
-        rlock.mmap = unsafe {
-            Mmap::map(&self.file).map_err(RmdbError::Io)?
-        };
-        drop(rlock);
-        drop(wlock);
-        Ok(())
-    }
-
     pub fn version(&self) -> u64 {
         return (RMDB_MAJOR as u64) << 48 +
                (RMDB_MINOR as u64) << 32 +
@@ -1001,7 +967,7 @@ pub struct RmdbWTxn<'a> {
 
 impl RmdbWTxn<'_> {
 
-    fn growdb(&mut self, to_page: u64) -> Result<(), RmdbError> {
+    pub fn growdb(&mut self, to_page: u64) -> Result<(), RmdbError> {
         /* always grow by no less than 64 pages to avoid constant churn as
          * pages are allocated piecemeal */
         let pages = ((to_page + 63) / 64) * 64;
