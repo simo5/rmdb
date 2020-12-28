@@ -153,7 +153,8 @@ const LEAF_KEY:      usize = 16; // [u8]
 pub enum RmdbError {
     InvalidDataSize,
     KeyNotFound,
-    KeyNotHere,
+    KeyTooSmall,
+    KeyTooBig,
     PageNotLeaf,
     InvalidMetadata,
     UnalignedAccess,
@@ -180,7 +181,8 @@ impl fmt::Display for RmdbError {
             RmdbError::UnalignedAccess => write!(f, "Unaligned Access Request"),
             RmdbError::InvalidMetadata => write!(f, "Invalid metadata"),
             RmdbError::KeyNotFound => write!(f, "Key not found"),
-            RmdbError::KeyNotHere => write!(f, "Key not in this (sub)tree"),
+            RmdbError::KeyTooSmall => write!(f, "Key not in this (sub)tree (too small)"),
+            RmdbError::KeyTooBig => write!(f, "Key not in this (sub)tree (too big)"),
             RmdbError::PageNotLeaf => write!(f, "Page is not a leaf"),
             RmdbError::InvalidDataSize => write!(f, "Invalid data size"),
             RmdbError::NotImplemented => write!(f, "Oooh!! Where's my code?"),
@@ -201,7 +203,8 @@ impl Error for RmdbError {
             RmdbError::UnalignedAccess => None,
             RmdbError::InvalidMetadata => None,
             RmdbError::KeyNotFound => None,
-            RmdbError::KeyNotHere => None,
+            RmdbError::KeyTooSmall => None,
+            RmdbError::KeyTooBig => None,
             RmdbError::PageNotLeaf => None,
             RmdbError::InvalidDataSize => None,
             RmdbError::NotImplemented => None,
@@ -795,26 +798,107 @@ impl<'a> RmdbFetch<'a> {
         let parents_size = parents.len();
 
         let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
+
+        /* test head and tail first, then dive into */
+        /* HEAD */
         if nptrs == 0 {
-            return Err(RmdbError::KeyNotHere);
+            return Err(RmdbError::KeyNotFound);
         }
 
-        /* TODO: change to a bisect */
-        for n in 0..nptrs {
-            /* if we are looping again, truncate any value aprevious branch
-             * may have added */
+        let head = 0usize;
+        let tail = nptrs - 1;
+
+        let pageptr = pagebuf_get_int!(u64, page, NODE_FIRSTPTR);
+        match self.get_leaf_key(pageptr) {
+            Ok(pkey) => {
+                if key == pkey {
+                    return Ok(pageptr);
+                }
+                if key < pkey {
+                    return Err(RmdbError::KeyTooSmall);
+                }
+            },
+            Err(error) => {
+                /* PageNotLeaf means this is a node of nodes */
+                match error {
+                    RmdbError::PageNotLeaf => (),
+                    _ => return Err(error),
+                };
+                match self.get_parents_leaf(pageptr, key, parents) {
+                    Ok(leaf) => return Ok(leaf),
+                    Err(error) => {
+                        /* KeyTooBig means continue with loop */
+                        match error {
+                            RmdbError::KeyTooBig => (),
+                            _ => return Err(error),
+                        };
+                    },
+                };
+            },
+        };
+
+        /* remove any parent the HEAD check may have added */
+        parents.truncate(parents_size);
+
+        /* TAIL */
+        if tail == head {
+            return Err(RmdbError::KeyTooBig);
+        }
+        let pageptr = pagebuf_get_int!(u64, page,
+                                       NODE_FIRSTPTR + tail * PAGEPTR_SIZE);
+        match self.get_leaf_key(pageptr) {
+            Ok(pkey) => {
+                if key == pkey {
+                    return Ok(pageptr);
+                }
+                if key > pkey {
+                    /* key not found, and found pkey is smaller, stop looking
+                     * as the key is not in here */
+                    return Err(RmdbError::KeyTooBig);
+                }
+            },
+            Err(error) => {
+                /* PageNotLeaf means this is a node of nodes */
+                match error {
+                    RmdbError::PageNotLeaf => (),
+                    _ => return Err(error),
+                };
+                match self.get_parents_leaf(pageptr, key, parents) {
+                    Ok(leaf) => return Ok(leaf),
+                    Err(error) => {
+                        /* KeyTooBig means we can't find it at all,
+                         * while KeyTooSmall means it may be in the
+                         * rest of the array */
+                        match error {
+                            RmdbError::KeyTooSmall => (),
+                            _ => return Err(error),
+                        };
+                    },
+                };
+            },
+        };
+
+        /* inner array, the key belongs to this node, whether it is found or not */
+        if nptrs == 2 {
+            return Err(RmdbError::KeyNotFound);
+        }
+
+        let mut bisect = [head + 1, tail - 1];
+        while bisect[0] <= bisect[1] {
+            /* remove any parent the previous check may have added */
             parents.truncate(parents_size);
-            let pageptr = pagebuf_get_int!(u64, page, NODE_FIRSTPTR + n * 8);
+            let mid = (bisect[0] + bisect[1]) / 2;
+            let pageptr = pagebuf_get_int!(u64, page,
+                                           NODE_FIRSTPTR + mid * PAGEPTR_SIZE);
             match self.get_leaf_key(pageptr) {
                 Ok(pkey) => {
                     if key == pkey {
                         return Ok(pageptr);
                     }
-                    if key < pkey {
-                        /* key not found, and found pkey is larger, so this
-                         * node would be the likely parent, of a child with
-                         * the requested key */
-                        return Ok(0);
+                    if key > pkey {
+                        bisect[0] = mid + 1;
+                    } else {
+                        bisect[1] = mid - 1;
                     }
                 },
                 Err(error) => {
@@ -828,9 +912,9 @@ impl<'a> RmdbFetch<'a> {
                             return Ok(leaf);
                         },
                         Err(error) => {
-                            /* KeyNotHere means continue with loop */
                             match error {
-                                RmdbError::KeyNotHere => (),
+                                RmdbError::KeyTooSmall => bisect[1] = mid -1,
+                                RmdbError::KeyTooBig => bisect[0] = mid + 1,
                                 _ => return Err(error),
                             };
                         },
@@ -838,11 +922,7 @@ impl<'a> RmdbFetch<'a> {
                 },
             };
         }
-        /* if we get here it means we scanned all keys in this (sub)tree and
-         * found the key is bigger than biggest stored key.
-         * return KeyNotHere which indicates that key could be found in the
-         * next parent's subtree */
-        return Err(RmdbError::KeyNotHere);
+        return Err(RmdbError::KeyNotFound);
     }
 
     fn get_parents(&self, pagenum: u64, key: &[u8])
@@ -851,7 +931,9 @@ impl<'a> RmdbFetch<'a> {
         match self.get_parents_leaf(pagenum, key, &mut parents) {
             Ok(_leaf) => Ok(parents),
             Err(error) => match error {
-                RmdbError::KeyNotHere => Ok(parents),
+                RmdbError::KeyNotFound => Ok(parents),
+                RmdbError::KeyTooSmall => Ok(parents),
+                RmdbError::KeyTooBig => Ok(parents),
                 _ => Err(error),
             },
         }
@@ -860,15 +942,10 @@ impl<'a> RmdbFetch<'a> {
     fn get_leaf(&self, pagenum: u64, key: &[u8]) -> Result<u64, RmdbError> {
         let mut parents = Vec::new();
         match self.get_parents_leaf(pagenum, key, &mut parents) {
-            Ok(leaf) => {
-                if leaf != 0 {
-                    Ok(leaf)
-                } else {
-                    Err(RmdbError::KeyNotFound)
-                }
-            },
+            Ok(leaf) => Ok(leaf),
             Err(error) => match error {
-                RmdbError::KeyNotHere => Err(RmdbError::KeyNotFound),
+                RmdbError::KeyTooSmall => Err(RmdbError::KeyNotFound),
+                RmdbError::KeyTooBig => Err(RmdbError::KeyNotFound),
                 _ => Err(error),
             },
         }
@@ -1198,15 +1275,10 @@ impl RmdbWTxn<'_> {
         let mut parents = Vec::new();
         let result = fetch.get_parents_leaf(self.rootpage, key, &mut parents);
         let leaf = match result {
-            Ok(leaf) => {
-                if leaf != 0 {
-                    leaf
-                } else {
-                    return Err(RmdbError::KeyNotFound)
-                }
-            },
+            Ok(leaf) => leaf,
             Err(error) => match error {
-                RmdbError::KeyNotHere => return Err(RmdbError::KeyNotFound),
+                RmdbError::KeyTooSmall => return Err(RmdbError::KeyNotFound),
+                RmdbError::KeyTooBig => return Err(RmdbError::KeyNotFound),
                 _ => return Err(error),
             },
         };
@@ -1295,7 +1367,7 @@ impl RmdbWTxn<'_> {
             /* reload, may have changed */
             let page = page_get_payload!(mut, self.rmdb, self.wlock.mmap, parent);
             let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
-            /* TODO: use bisection */
+
             let mut idx = NODE_FIRSTPTR;
             for _ in 0..nptrs {
                 let node = pagebuf_get_int!(u64, page, idx);
@@ -1417,7 +1489,6 @@ impl RmdbWTxn<'_> {
 
         let mut idx = NODE_FIRSTPTR;
         let mut ins = 0usize;
-        /* TODO: use bisection */
         for n in 0..nptrs {
             let node = pagebuf_get_int!(u64, page, idx);
             if node == current {
@@ -1562,7 +1633,6 @@ impl RmdbWTxn<'_> {
 
         /* remove leaf from index */
         let mut loc = 0usize;
-        /* TODO: use bisection */
         for n in 0..nptrs {
             let idx = NODE_FIRSTPTR + n * PAGEPTR_SIZE;
             let node = pagebuf_get_int!(u64, page, idx);
