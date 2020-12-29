@@ -81,12 +81,30 @@ fn test(name: String, opt: Option<RmdbOptions>) {
         handle.join().unwrap();
     }
 
-    let txn = rmdb.get_read_transaction().unwrap();
+    let mut txn = rmdb.get_read_transaction().unwrap();
     for i in [0,2,4,6,8].iter() {
         let key = format!("test{}", i);
         let value = txn.get_entry(key.as_bytes()).unwrap();
         println!("Key/Value = {}/{}", key,
             std::str::from_utf8(&value[0]).unwrap());
+    }
+
+    /* test cursor setting */
+    let key1 = "test4".as_bytes();
+    let key2 = "test6".as_bytes();
+    let mut cursor = txn.get_cursor().unwrap();
+    cursor.set_to(key1).unwrap();
+    let res = cursor.get_current().unwrap();
+    if res.0 != key1 {
+        println!("Setting cursor, expected {}, got {}",
+                 std::str::from_utf8(key1).unwrap(),
+                 std::str::from_utf8(res.0).unwrap());
+    }
+    let res = cursor.get_next().unwrap();
+    if res.0 != key2 {
+        println!("Setting cursor, expected {}, got {}",
+                 std::str::from_utf8(key2).unwrap(),
+                 std::str::from_utf8(res.0).unwrap());
     }
 }
 

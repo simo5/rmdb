@@ -1007,7 +1007,7 @@ pub struct RmdbCursor<'a> {
 
 impl<'a> RmdbCursor<'a> {
 
-    fn get_current(&mut self) -> Result<(&[u8], Vec<&'a [u8]>), RmdbError> {
+    pub fn get_current(&mut self) -> Result<(&[u8], Vec<&'a [u8]>), RmdbError> {
         let fetch = RmdbFetch::new(self.txn.rmdb, &self.txn.rlock.mmap,
                                    self.txn.rlock.rootpage);
         let leafnum = match self.cursor.last() {
@@ -1031,6 +1031,16 @@ impl<'a> RmdbCursor<'a> {
             self.cursor = fetch.get_next_element(&self.cursor)?;
         }
         self.get_current()
+    }
+
+    pub fn set_to(&mut self, key: &[u8]) -> Result<(), RmdbError> {
+        let fetch = RmdbFetch::new(self.txn.rmdb, &self.txn.rlock.mmap,
+                                   self.txn.rlock.rootpage);
+        let mut chain = Vec::new();
+        let leaf = fetch.get_parents_leaf(0, key, &mut chain)?;
+        chain.push(leaf);
+        self.cursor = chain;
+        Ok(())
     }
 }
 
