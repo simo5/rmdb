@@ -113,7 +113,7 @@ fn testload(name: String, opt: Option<RmdbOptions>,
     txn.commit().unwrap();
     drop(txn);
 
-    let txn = rmdb.get_read_transaction().unwrap();
+    let mut txn = rmdb.get_read_transaction().unwrap();
     for i in 0..num {
         let key = format!("test{}", i);
         let result = txn.get_entry(key.as_bytes());
@@ -123,6 +123,18 @@ fn testload(name: String, opt: Option<RmdbOptions>,
                 println!("Reading Key {} got {}", key, error);
             },
         };
+    }
+    /* also check we find all elements via cursor */
+    let mut keys = Vec::new();
+    for i in 0..num {
+        keys.push(format!("test{}", i));
+    }
+    let mut cursor = txn.get_cursor().unwrap();
+    while let Ok(x) = cursor.get_next() {
+        keys.retain(|k| k != std::str::from_utf8(x.0).unwrap());
+    }
+    if keys.len() != 0 {
+        println!("Could not find entries: {:?}", keys);
     }
     drop(txn);
 

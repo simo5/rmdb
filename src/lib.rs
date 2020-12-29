@@ -161,6 +161,7 @@ pub enum RmdbError {
     UnalignedAccess,
     LockError,
     IntegrityCheck,
+    InvalidCursor,
     InvalidIndexSize,
     InvalidFileSize,
     InvalidDBFile,
@@ -186,6 +187,7 @@ impl fmt::Display for RmdbError {
             RmdbError::KeyTooBig => write!(f, "Key not in this (sub)tree (too big)"),
             RmdbError::PageNotLeaf => write!(f, "Page is not a leaf"),
             RmdbError::InvalidDataSize => write!(f, "Invalid data size"),
+            RmdbError::InvalidCursor => write!(f, "Invalid Cursor"),
             RmdbError::NotImplemented => write!(f, "Oooh!! Where's my code?"),
         }
     }
@@ -208,6 +210,7 @@ impl Error for RmdbError {
             RmdbError::KeyTooBig => None,
             RmdbError::PageNotLeaf => None,
             RmdbError::InvalidDataSize => None,
+            RmdbError::InvalidCursor => None,
             RmdbError::NotImplemented => None,
         }
     }
@@ -551,7 +554,7 @@ impl Rmdb {
             return Err(RmdbError::IntegrityCheck)
         }
 
-        let fetch = RmdbFetch::new(self, &rlock.mmap);
+        let fetch = RmdbFetch::new(self, &rlock.mmap, rlock.rootpage);
         /* now check integrity of the three fundamental pages */
         fetch.integrity_check(0)?;
         fetch.integrity_check(1)?;
@@ -677,24 +680,20 @@ pub enum RmdbTxnState {
     Scrubbed
 }
 
-pub struct RmdbTxn<'a> {
-    rlock: RwLockReadGuard<'a, RmdbRd>,
-    status: RmdbTxnState,
-    rmdb: &'a Rmdb,
-}
-
 struct RmdbFetch<'a> {
     rmdb: &'a Rmdb,
     mmap: &'a [u8],
+    rootpage: u64,
 }
 
 impl<'a> RmdbFetch<'a> {
 
-    fn new(rmdb: &'a Rmdb,
-           mmap: &'a [u8]) -> RmdbFetch<'a> {
+    fn new(rmdb: &'a Rmdb, mmap: &'a [u8], rootpage: u64)
+            -> RmdbFetch<'a> {
         RmdbFetch {
             rmdb: rmdb,
             mmap: mmap,
+            rootpage: rootpage,
         }
     }
 
@@ -743,20 +742,27 @@ impl<'a> RmdbFetch<'a> {
         Ok(res)
     }
 
-    fn get_leaf_key(&self, leaf: u64) -> Result<&[u8], RmdbError> {
+    fn get_leaf_key(&self, leaf: u64) -> Result<&'a [u8], RmdbError> {
         let page = page_get_payload!(self.rmdb, self.mmap, leaf);
         let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
         if ptype & PAGE_LEAF == PAGE_LEAF {
             let klen = pagebuf_get_int!(u16, page, LEAF_KEYLEN) as usize;
-            Ok(pagebuf_get_buf!(page, LEAF_KEY, klen))
+            Ok(page_get_buf!(self.rmdb, self.mmap, leaf, LEAF_KEY, klen))
         } else {
             Err(RmdbError::PageNotLeaf)
         }
     }
 
-    /* pagenum must be a node page */
-    fn get_parents_leaf(&self, pagenum: u64, key: &[u8],
+    /* base must be a node page, if 0 is provided we start from rootpage */
+    fn get_parents_leaf(&self, base: u64, key: &[u8],
                         parents: &mut Vec<u64>) -> Result<u64, RmdbError> {
+        let mut pagenum = base;
+        if pagenum == 0 {
+            if self.rootpage == 0 {
+                return Err(RmdbError::KeyNotFound);
+            }
+            pagenum = self.rootpage;
+        }
         let page = page_get_payload!(self.rmdb, self.mmap, pagenum);
         let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
         if ptype & PAGE_NODE != PAGE_NODE {
@@ -893,10 +899,9 @@ impl<'a> RmdbFetch<'a> {
         return Err(RmdbError::KeyNotFound);
     }
 
-    fn get_parents(&self, pagenum: u64, key: &[u8])
-                   -> Result<Vec<u64>, RmdbError> {
+    fn get_parents(&self, key: &[u8]) -> Result<Vec<u64>, RmdbError> {
         let mut parents = Vec::new();
-        match self.get_parents_leaf(pagenum, key, &mut parents) {
+        match self.get_parents_leaf(0, key, &mut parents) {
             Ok(_leaf) => Ok(parents),
             Err(error) => match error {
                 RmdbError::KeyNotFound => Ok(parents),
@@ -907,9 +912,9 @@ impl<'a> RmdbFetch<'a> {
         }
     }
 
-    fn get_leaf(&self, pagenum: u64, key: &[u8]) -> Result<u64, RmdbError> {
+    fn get_leaf(&self, key: &[u8]) -> Result<u64, RmdbError> {
         let mut parents = Vec::new();
-        match self.get_parents_leaf(pagenum, key, &mut parents) {
+        match self.get_parents_leaf(0, key, &mut parents) {
             Ok(leaf) => Ok(leaf),
             Err(error) => match error {
                 RmdbError::KeyTooSmall => Err(RmdbError::KeyNotFound),
@@ -918,22 +923,142 @@ impl<'a> RmdbFetch<'a> {
             },
         }
     }
+
+    fn get_first_element(&self) -> Result<Vec<u64>, RmdbError> {
+        if self.rootpage == 0 {
+            return Err(RmdbError::KeyNotFound);
+        }
+        let mut res: Vec<u64> = Vec::new();
+        let mut pagenum = self.rootpage;
+        let mut page = page_get_payload!(self.rmdb, self.mmap, pagenum);
+        let mut ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+        while ptype & PAGE_NODE == PAGE_NODE {
+            res.push(pagenum);
+            pagenum = pagebuf_get_int!(u64, page, NODE_FIRSTPTR);
+            page = page_get_payload!(self.rmdb, self.mmap, pagenum);
+            ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+        }
+        if res.len() == 0 || ptype & PAGE_LEAF != PAGE_LEAF {
+            return Err(RmdbError::InvalidMetadata);
+        }
+        /* add the leaf too */
+        res.push(pagenum);
+        Ok(res)
+    }
+
+    fn get_next_element(&self, chain: &Vec<u64>)
+            -> Result<Vec<u64>, RmdbError> {
+        let mut walker = chain.to_vec();
+        let mut current = walker.pop().ok_or_else(
+                                            || RmdbError::InvalidMetadata)?;
+        while walker.len() > 0 {
+            let parent = *walker.last().ok_or_else(
+                                            || RmdbError::InvalidMetadata)?;
+            let page = page_get_payload!(self.rmdb, self.mmap, parent);
+            let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+            if  ptype & PAGE_NODE != PAGE_NODE {
+                return Err(RmdbError::InvalidMetadata);
+            }
+            let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
+            if nptrs == 0 {
+                return Err(RmdbError::InvalidMetadata);
+            }
+
+            let mut ptr = 0usize;
+            if current == 0 {
+                ptr = NODE_FIRSTPTR;
+            } else {
+                let mut idx = NODE_FIRSTPTR;
+                for _ in 0..(nptrs - 1) {
+                    let node = pagebuf_get_int!(u64, page, idx);
+                    if node == current {
+                        ptr = idx + PAGEPTR_SIZE;
+                        break;
+                    }
+                    idx += PAGEPTR_SIZE;
+                }
+            }
+            if ptr != 0 {
+                let node = pagebuf_get_int!(u64, page, ptr);
+                let page = page_get_payload!(self.rmdb, self.mmap, node);
+                let ptype = pagebuf_get_int!(u32, page, POS_PAGETYPE);
+                if  ptype & PAGE_LEAF == PAGE_LEAF {
+                    /* found */
+                    walker.push(node);
+                    return Ok(walker);
+                } else if ptype & PAGE_NODE == PAGE_NODE {
+                    walker.push(node);
+                    current = 0;
+                }
+            } else {
+                current = walker.pop().ok_or_else(
+                                            || RmdbError::InvalidMetadata)?;
+            }
+        }
+        /* we reached the last element */
+        Err(RmdbError::KeyNotFound)
+    }
+}
+
+pub struct RmdbCursor<'a> {
+    txn: &'a RmdbTxn<'a>,
+    cursor: Vec<u64>,
+}
+
+impl<'a> RmdbCursor<'a> {
+
+    fn get_current(&mut self) -> Result<(&[u8], Vec<&'a [u8]>), RmdbError> {
+        let fetch = RmdbFetch::new(self.txn.rmdb, &self.txn.rlock.mmap,
+                                   self.txn.rlock.rootpage);
+        let leafnum = match self.cursor.last() {
+            Some(x) => *x,
+            None => {
+                self.cursor = fetch.get_first_element()?;
+                *self.cursor.last().unwrap()
+            },
+        };
+        let key = fetch.get_leaf_key(leafnum)?;
+        let val = fetch.get_data(leafnum)?;
+        Ok((key, val))
+    }
+
+    pub fn get_next(&mut self) -> Result<(&[u8], Vec<&'a [u8]>), RmdbError> {
+        let fetch = RmdbFetch::new(self.txn.rmdb, &self.txn.rlock.mmap,
+                                   self.txn.rlock.rootpage);
+        if self.cursor.len() == 0 {
+            self.cursor = fetch.get_first_element()?;
+        } else {
+            self.cursor = fetch.get_next_element(&self.cursor)?;
+        }
+        self.get_current()
+    }
+}
+
+pub struct RmdbTxn<'a> {
+    rlock: RwLockReadGuard<'a, RmdbRd>,
+    status: RmdbTxnState,
+    rmdb: &'a Rmdb,
 }
 
 impl RmdbTxn<'_> {
 
     pub fn get_entry(&self, key: &[u8]) -> Result<Vec<&[u8]>, RmdbError> {
-        if self.rlock.rootpage == 0 {
-            return Err(RmdbError::KeyNotFound);
-        }
-        let fetch = RmdbFetch::new(self.rmdb, &self.rlock.mmap);
-        let leaf = fetch.get_leaf(self.rlock.rootpage, key)?;
+        let fetch = RmdbFetch::new(self.rmdb, &self.rlock.mmap,
+                                   self.rlock.rootpage);
+        let leaf = fetch.get_leaf(key)?;
         fetch.integrity_check(leaf)?;
         fetch.get_data(leaf)
     }
 
     fn _scrub(&mut self) {
         self.status = RmdbTxnState::Scrubbed
+    }
+
+    pub fn get_cursor<'a>(&'a mut self) -> Result<RmdbCursor<'a>, RmdbError> {
+        Ok(RmdbCursor {
+            txn: self,
+            cursor: Vec::new(),
+        })
     }
 
     pub fn scrub(&mut self) -> Result<(), RmdbError> {
@@ -1118,8 +1243,8 @@ impl RmdbWTxn<'_> {
         if self.rootpage == 0 {
             return Err(RmdbError::KeyNotFound);
         }
-        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap);
-        let leaf = fetch.get_leaf(self.rootpage, key)?;
+        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap, self.rootpage);
+        let leaf = fetch.get_leaf(key)?;
         fetch.get_data(leaf)
     }
 
@@ -1211,8 +1336,8 @@ impl RmdbWTxn<'_> {
         }
 
         /* then add them to the tree */
-        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap);
-        let cur_leaf = fetch.get_leaf(self.rootpage, key);
+        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap, self.rootpage);
+        let cur_leaf = fetch.get_leaf(key);
         let cur_leaf = match cur_leaf {
             Ok(cur_leaf) => cur_leaf,
             Err(error) => {
@@ -1238,9 +1363,9 @@ impl RmdbWTxn<'_> {
         if self.rootpage == 0 {
             return Err(RmdbError::KeyNotFound);
         }
-        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap);
+        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap, self.rootpage);
         let mut parents = Vec::new();
-        let result = fetch.get_parents_leaf(self.rootpage, key, &mut parents);
+        let result = fetch.get_parents_leaf(0, key, &mut parents);
         let leaf = match result {
             Ok(leaf) => leaf,
             Err(error) => match error {
@@ -1358,9 +1483,9 @@ impl RmdbWTxn<'_> {
 
     fn replace_leaf(&mut self, curchild: u64, newchild: u64)
             -> Result<(), RmdbError> {
-        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap);
+        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap, self.rootpage);
         let key = fetch.get_leaf_key(curchild)?;
-        let mut parents = fetch.get_parents(self.rootpage, key)?;
+        let mut parents = fetch.get_parents(key)?;
         let mut parent = match parents.pop() {
             Some(parent) => parent,
             None => return Err(RmdbError::InvalidMetadata),
@@ -1495,8 +1620,8 @@ impl RmdbWTxn<'_> {
 
     fn add_leaf(&mut self, leaf: u64, key: &[u8])
             -> Result<(), RmdbError> {
-        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap);
-        let mut parents = fetch.get_parents(self.rootpage, key)?;
+        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap, self.rootpage);
+        let mut parents = fetch.get_parents(key)?;
         drop(fetch);
         let mut parent = match parents.pop() {
             Some(parent) => parent,
@@ -1517,12 +1642,14 @@ impl RmdbWTxn<'_> {
             self.split_node(&mut parents, parent)?;
 
             /* after split find again which node to be added to */
-            let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap);
-            parents = fetch.get_parents(self.rootpage, key)?;
+            let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap,
+                                       self.rootpage);
+            parents = fetch.get_parents(key)?;
             parent = match parents.pop() {
                 Some(parent) => parent,
                 None => return Err(RmdbError::InvalidMetadata),
             };
+            drop(fetch);
         }
 
         /* map page again as it may have changed */
@@ -1535,7 +1662,7 @@ impl RmdbWTxn<'_> {
         }
 
         /* add leaf to index */
-        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap);
+        let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap, self.rootpage);
         let mut idx = NODE_FIRSTPTR;
         for n in (0..nptrs).rev() {
             idx = NODE_FIRSTPTR + n * 8;
@@ -1549,6 +1676,7 @@ impl RmdbWTxn<'_> {
                 break;
             }
         }
+        drop(fetch);
 
         /* we found the insertion point, add key index here, and move,
          * all other upwards */
