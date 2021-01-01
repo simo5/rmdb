@@ -8,11 +8,17 @@ edition = "2018"
 name = "benchmark"
 harness = false
 
+[[bench]]
+name = "benchmark2"
+harness = false
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 bencher = "0.1.5"
 bitflags = "^1.2.1"
 memmap = "0.7.0"
+num-format = { version = "0.4", features = ["with-system-locale"] }
 openssl-sys = "0.9"
 openssl = "0.10"
+

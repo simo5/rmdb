@@ -583,6 +583,11 @@ impl Rmdb {
         return self.flags;
     }
 
+    pub fn size(&self) -> Result<u64, RmdbError> {
+        let meta = self.file.metadata()?;
+        Ok(meta.len())
+    }
+
     pub fn get_read_transaction<'a>(&'a self) -> Result<RmdbTxn<'a>, RmdbError> {
         let rlock = self.rlock.read().unwrap();
         Ok(RmdbTxn {
