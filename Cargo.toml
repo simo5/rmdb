@@ -21,4 +21,4 @@ memmap = "0.7.0"
 num-format = { version = "0.4", features = ["with-system-locale"] }
 openssl-sys = "0.9"
 openssl = "0.10"
-
+rand = ">0.6.0"
