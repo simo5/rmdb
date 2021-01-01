@@ -1487,6 +1487,8 @@ impl RmdbWTxn<'_> {
             if idx == NODE_FIRSTPTR + nptrs * PAGEPTR_SIZE {
                 return Err(RmdbError::InvalidMetadata);
             }
+            /* put, potentially new, parent back in the parents stack */
+            parents.push(parent);
         }
         Ok(newpage)
     }
@@ -1589,8 +1591,7 @@ impl RmdbWTxn<'_> {
         }
         pagebuf_set_int!(u32, page, NODE_NUMPTRS, rptrs as u32);
 
-        /* finally update the parent to insert two pages where
-         * the current is */
+        /* update the parent to insert two pages where the current is */
         let page = page_get_payload!(mut, self.rmdb, self.wlock.mmap, parent);
         let nptrs = pagebuf_get_int!(u32, page, NODE_NUMPTRS) as usize;
 
@@ -1611,7 +1612,7 @@ impl RmdbWTxn<'_> {
             let node = pagebuf_get_int!(u64, page, idx);
             pagebuf_set_int!(u64, page, idx + 8, node);
         }
-        /* finally set left and right nodes */
+        /* set left and right nodes */
         idx = NODE_FIRSTPTR + ins * PAGEPTR_SIZE;
         pagebuf_set_int!(u64, page, idx, left);
         pagebuf_set_int!(u64, page, idx + 8, right);
@@ -1622,6 +1623,9 @@ impl RmdbWTxn<'_> {
             /* if we split the root we get a new empty top node */
             pagebuf_set_int!(u32, page, NODE_NUMPTRS, 2u32);
         }
+
+        /* add new parent onto the parents stack now */
+        parents.push(parent);
 
         /* remove old splitted page */
         self.delete_page(current);
@@ -1649,15 +1653,20 @@ impl RmdbWTxn<'_> {
             }
         } else {
             /* page split */
-            self.split_node(&mut parents, parent)?;
+            let (left, right) = self.split_node(&mut parents, parent)?;
 
             /* after split find again which node to be added to */
             let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap,
                                        self.rootpage);
-            parents = fetch.get_parents(key)?;
-            parent = match parents.pop() {
-                Some(parent) => parent,
-                None => return Err(RmdbError::InvalidMetadata),
+            let mut dummy = Vec::new();
+            parent = match fetch.get_parents_leaf(left, key, &mut dummy) {
+                Ok(_leaf) => return Err(RmdbError::InvalidMetadata),
+                Err(error) => match error {
+                    RmdbError::KeyNotFound => left,
+                    RmdbError::KeyTooSmall => left,
+                    RmdbError::KeyTooBig => right,
+                    _ => return Err(error),
+                },
             };
             drop(fetch);
         }
