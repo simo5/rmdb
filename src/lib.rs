@@ -680,7 +680,8 @@ impl Rmdb {
             -> Result<(), RmdbError> {
         if self.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
             let page = page_get_whole!(mut, self, mmap, pagenum);
-            let hash = compute_hash(&page[0..(self.pagesize - RMDB_INTGSIZE)]);
+            let datavec = vec![&page[0..(self.pagesize - RMDB_INTGSIZE)]];
+            let hash = compute_hash(&datavec);
             page[(self.pagesize - RMDB_INTGSIZE)..self.pagesize].copy_from_slice(&hash);
         }
         Ok(())
@@ -693,6 +694,21 @@ impl Rmdb {
         }
         let page = page_get_whole!(self, mmap, pagenum);
         let (data, verify) = page.split_at(self.payload);
+        let hash = compute_hash(&vec![data]);
+        if verify != hash {
+            return Err(RmdbError::IntegrityCheck)
+        }
+        Ok(())
+    }
+
+    fn data_integrity_check(&self, mmap: &[u8], leaf: u32, data: &Vec<&[u8]>)
+            -> Result<(), RmdbError> {
+        if !self.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
+            return Ok(())
+        }
+        let page = page_get_payload!(self, mmap, leaf);
+        let verify = pagebuf_get_buf!(page, self.payload - RMDB_INTGSIZE,
+                                      RMDB_INTGSIZE);
         let hash = compute_hash(data);
         if verify != hash {
             return Err(RmdbError::IntegrityCheck)
@@ -969,7 +985,7 @@ impl Rmdb {
         let freemap = &wlock.mmap[fs..fe];
 
         if self.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
-            let hash = compute_hash(freemap);
+            let hash = compute_hash(&vec![freemap]);
             let lastpage = fpptr + curpages - 1;
             let hashpage = page_get_whole!(self, wlock.mmap, lastpage);
             if hash != hashpage[pl..ps] {
@@ -1061,7 +1077,7 @@ impl Rmdb {
 
         /* optionally integrity protect freepages */
         if self.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
-            let hash = compute_hash(&freemap);
+            let hash = compute_hash(&vec![&freemap]);
             let lastpage = newptr + newsize - 1;
             let hashpage = page_get_whole!(mut, self, wlock.mmap, lastpage);
             hashpage[pl..ps].copy_from_slice(&hash);
@@ -1162,9 +1178,11 @@ fn page_range(pagesize: usize, index: u32, offset: usize, size: usize)
     ))
 }
 
-fn compute_hash(data: &[u8]) -> [u8; 32] {
+fn compute_hash(data: &Vec<&[u8]>) -> [u8; RMDB_INTGSIZE] {
     let mut hasher = sha::Sha256::new();
-    hasher.update(data);
+    for d in data {
+        hasher.update(d);
+    }
     hasher.finish()
 }
 
@@ -1192,7 +1210,8 @@ impl<'a> RmdbFetch<'a> {
     }
 
     // returns root when key not found
-    fn get_data(&self, leafnum: u32) -> Result<Vec<&'a [u8]>, RmdbError> {
+    fn get_data(&self, leafnum: u32, integrity_check: bool)
+            -> Result<Vec<&'a [u8]>, RmdbError> {
         let page = page_get_payload!(self.rmdb, self.mmap, leafnum);
         let ptype = pagebuf_get_int!(u16, page, POS_PAGETYPE);
         if ptype & PAGE_LEAF != PAGE_LEAF {
@@ -1219,6 +1238,9 @@ impl<'a> RmdbFetch<'a> {
             let dpage = pagebuf_get_int!(u32, page, pageptr + i * PTRSZ);
             res.push(page_get_buf!(self.rmdb, self.mmap, dpage, 0, size));
             dptr += size;
+        }
+        if integrity_check == true {
+            self.rmdb.data_integrity_check(self.mmap, leafnum, &res)?;
         }
         Ok(res)
     }
@@ -1499,7 +1521,7 @@ impl<'a> RmdbCursor<'a> {
             },
         };
         let key = fetch.get_leaf_key(leafnum)?;
-        let val = fetch.get_data(leafnum)?;
+        let val = fetch.get_data(leafnum, true)?;
         Ok((key, val))
     }
 
@@ -1538,8 +1560,7 @@ impl RmdbTxn<'_> {
                                    self.rlock.rootpage);
         let leaf = fetch.get_leaf(key)?;
         self.rmdb.integrity_check(&self.rlock.mmap, leaf)?;
-        fetch.get_data(leaf)
-        /* FIXME: integrity check data */
+        fetch.get_data(leaf, true)
     }
 
     fn _scrub(&mut self) {
@@ -1592,7 +1613,7 @@ impl RmdbWTxn<'_> {
         }
         let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap, self.rootpage);
         let leaf = fetch.get_leaf(key)?;
-        fetch.get_data(leaf)
+        fetch.get_data(leaf, true)
     }
 
     pub fn add_entry(&mut self, key: &[u8], value: &[u8])
@@ -1659,7 +1680,7 @@ impl RmdbWTxn<'_> {
         /* copy data */
         //TODO: compute hash as we store data
         if self.rmdb.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
-            let hash = compute_hash(value);
+            let hash = compute_hash(&vec![value]);
             pagebuf_set_buf!(&mut leafpage, leaf_payload, &hash);
         }
 
