@@ -1582,14 +1582,6 @@ pub struct RmdbWTxn<'a> {
 
 impl RmdbWTxn<'_> {
 
-    fn get_free_pages(&mut self, n:usize) -> Result<Vec<u32>, RmdbError> {
-        let res = self.rmdb.get_free_pages(n, &mut self.wlock, false)?;
-        for i in &res {
-            self.mark_dirty(*i, true);
-        }
-        Ok(res)
-    }
-
     fn put_free_pages(&mut self, pvec: &mut Vec<u32>) -> Result<(), RmdbError> {
         self.rmdb.put_free_pages(pvec, &mut self.wlock)
     }
@@ -1635,10 +1627,12 @@ impl RmdbWTxn<'_> {
             dataptr = LEAF_KEY + align!(u32, key.len());
         }
 
-        let pagevec = self.get_free_pages(pages + 1)?;
+        let pagevec = self.rmdb.get_free_pages(pages + 1, &mut self.wlock, true)?;
 
         /* write leaf page */
         let leaf = pagevec[0];
+        self.mark_dirty(leaf, true);
+
         let mut leafpage = page_get_payload!(mut, self.rmdb, self.wlock.mmap, leaf);
 
         pagebuf_set_int!(u16, &mut leafpage, POS_PAGETYPE, PAGE_LEAF);
@@ -1779,7 +1773,8 @@ impl RmdbWTxn<'_> {
     }
 
     fn get_new_page_copy(&mut self, source: u32) -> Result<u32, RmdbError> {
-        let copy = self.get_free_pages(1)?[0];
+        let copy = self.rmdb.get_free_pages(1, &mut self.wlock, false)?[0];
+        self.mark_dirty(copy, false);
         self.page_copy(source, copy)?;
 
         Ok(copy)
@@ -1865,7 +1860,9 @@ impl RmdbWTxn<'_> {
             Some(parent) => parent,
             None => {
                 /* splitting root node */
-                let rootpage = self.get_free_pages(1)?[0];
+                let rootpage = self.rmdb.get_free_pages(1, &mut self.wlock,
+                                                        false)?[0];
+                self.mark_dirty(rootpage, true);
                 let mut page = page_get_payload!(mut, self.rmdb, self.wlock.mmap,
                                                  rootpage);
                 pagebuf_set_int!(u16, &mut page, POS_PAGETYPE,
