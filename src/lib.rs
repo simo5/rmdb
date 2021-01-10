@@ -136,32 +136,53 @@ const NODE_FIRSTPTR: usize = 1 * PTRSZ;  // u32
 /* Leaf page structure:
  *   0      16      32
  *   -----------------
- * 0 | TYPE  | RSRVD |
+ * 0 | TYPE  | #Keys |
  *   |---------------|
- * 1 |   DATASIZE    |
+ * 1 | #Kptr1| ...   |
  *   |---------------|
- * 2 |  dLen | dPtr  |
- *   |---------------|
- * 3 | pgPtr | kLen  |
- *   |---------------|
- * 4 | KEY ...       |
- *   .   ...         .
- *   |---------------|
- * 5 . DATA ...      .
- *   .   ...         .
- *   |---------------|
- * 6 | 1ST DATA PTR  |
- *   |---------------|
- * . .   ...         .
- * . |---------------|
- * . |  LAST PTR     |
- *   |---------------|
- *   . OPIONAL DATA  .
- *   . INTEG/ENCR TAG.
+ *   . ...           .
  *   |----------------
  *   . OPIONAL       .
  *   . INTEGRITY /   .
  *   . ENCRYPTION    .
+ *   .................
+ */
+const LEAF_KEYNUM:  usize = 2; // u16
+const LEAF_KEYPTRS: usize = 4; // [u16]
+
+/*
+ * Individual key/data structures.
+ * There are two cases.
+ * Klen is marked specially, if the high bit is 0 it means
+ * we are in case 1. If the high bit is 1 we are in case 2.
+ *
+ *
+ * 1. all data fits into the remaining of the leaf page:
+ *   0      16      32
+ *   -----------------
+ * 0 |[0]kLen| Key...|
+ *   |---------------|
+ *   .   ...         .
+ *   |---------------|
+ * X | dLen  | data..| //u32 aligned
+ *   |---------------|
+ * . .   ...         .
+ * . |---------------|
+ *
+ * 2. data is bigger than available space:
+ * NOTE: we assume contiguous data pages, no fragmentation
+ * is allowed for a single data element at this time.
+ *   0      16      32
+ * 0 |[1]kLen| Key...|
+ *   |---------------|
+ *   .   ...         .
+ *   -----------------
+ * X | Datasize      | //u32 aligned
+ *   |---------------|
+ * X | 1ST PAGE PTR  |
+ *   |---------------|
+ *   . OPIONAL DATA  .
+ *   . INTEG/ENCR TAG.
  *   .................
  *
  * The number of aditional pages is
@@ -171,12 +192,8 @@ const NODE_FIRSTPTR: usize = 1 * PTRSZ;  // u32
  * be contained directly in the Leaf
  * page in the DATA section.
  */
-const LEAF_DATASIZE: usize = 1 * PTRSZ;     // u32
-const LEAF_DATALEN:  usize = 2 * PTRSZ;     // u16
-const LEAF_DATAPTR:  usize = 2 * PTRSZ + 2; // u16
-const LEAF_PAGEPTR:  usize = 3 * PTRSZ;     // u16
-const LEAF_KEYLEN:   usize = 3 * PTRSZ + 2; // u16
-const LEAF_KEY:      usize = 4 * PTRSZ;     // [u8]
+const LEAF_PL_KLEN: usize = 0; // u15!! (high bit is type)
+const LEAF_PL_KEY: usize = 2;  // [u8]
 
 
 #[derive(Debug)]
@@ -314,6 +331,23 @@ impl RmdbOptions {
         self.readonly = true;
         self
     }
+}
+
+macro_rules! page_get_many {
+    ($rmdb:expr, $mmap:expr, $page:expr, $num:expr) => {
+        {
+            let start = $page as usize * $rmdb.pagesize;
+            let end = start + $num as usize * $rmdb.pagesize;
+            &$mmap[start..end]
+        }
+    };
+    (mut, $rmdb:expr, $mmap:expr, $page:expr, $num:expr) => {
+        {
+            let start = $page as usize * $rmdb.pagesize;
+            let end = start + $num as usize * $rmdb.pagesize;
+            &mut $mmap[start..end]
+        }
+    };
 }
 
 macro_rules! page_get_whole {
@@ -701,14 +735,11 @@ impl Rmdb {
         Ok(())
     }
 
-    fn data_integrity_check(&self, mmap: &[u8], leaf: u32, data: &Vec<&[u8]>)
+    fn data_integrity_check(&self, data: &Vec<&[u8]>, verify: &[u8])
             -> Result<(), RmdbError> {
         if !self.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
             return Ok(())
         }
-        let page = page_get_payload!(self, mmap, leaf);
-        let verify = pagebuf_get_buf!(page, self.payload - RMDB_INTGSIZE,
-                                      RMDB_INTGSIZE);
         let hash = compute_hash(data);
         if verify != hash {
             return Err(RmdbError::IntegrityCheck)
@@ -1210,7 +1241,7 @@ impl<'a> RmdbFetch<'a> {
     }
 
     // returns root when key not found
-    fn get_data(&self, leafnum: u32, integrity_check: bool)
+    fn get_data(&self, leafnum: u32, key: &[u8], integrity_check: bool)
             -> Result<Vec<&'a [u8]>, RmdbError> {
         let page = page_get_payload!(self.rmdb, self.mmap, leafnum);
         let ptype = pagebuf_get_int!(u16, page, POS_PAGETYPE);
@@ -1218,42 +1249,53 @@ impl<'a> RmdbFetch<'a> {
             return Err(RmdbError::InvalidMetadata);
         }
 
-        /* then fetch data */
-        let dsize = pagebuf_get_int!(u32, page, LEAF_DATASIZE) as usize;
-        let dlen = pagebuf_get_int!(u16, page, LEAF_DATALEN) as usize;
-        let pagesize = self.rmdb.pagesize;
-        let pages = (dsize - dlen + pagesize - 1) / pagesize;
-        let pageptr = pagebuf_get_int!(u16, page, LEAF_PAGEPTR) as usize;
-        let mut res = Vec::with_capacity(pages + 1);
-        if dlen > 0 {
-            let dptr = pagebuf_get_int!(u16, page, LEAF_DATAPTR) as usize;
-            res.push(&page[dptr..(dptr + dlen)]);
-        }
-        let mut dptr = dlen;
-        for i in 0..pages {
-            let mut size = dsize - dptr;
-            if size > pagesize {
-                size = pagesize;
+        let mut res = Vec::new();
+
+        /* find data */
+        let keynum = pagebuf_get_int!(u16, page, LEAF_KEYNUM);
+        for k in 0..keynum as usize {
+            let base = pagebuf_get_int!(u16, page, LEAF_KEYPTRS + k) as usize;
+            let klen = pagebuf_get_int!(u16, page, base + LEAF_PL_KLEN);
+            let kl = (klen & 0x7FFF) as usize;
+            let kk = pagebuf_get_buf!(page, base + LEAF_PL_KEY as usize, kl);
+            if kk != key {
+                continue;
             }
-            let dpage = pagebuf_get_int!(u32, page, pageptr + i * PTRSZ);
-            res.push(page_get_buf!(self.rmdb, self.mmap, dpage, 0, size));
-            dptr += size;
-        }
-        if integrity_check == true {
-            self.rmdb.data_integrity_check(self.mmap, leafnum, &res)?;
+            let dataptr = align!(u32, base + 2 + kl);
+            if klen as usize == kl {
+                let datalen = pagebuf_get_int!(u16, page, dataptr) as usize;
+                res.push(&page[(dataptr + 2)..(dataptr + 2 + datalen)]);
+            } else {
+                let dsize = pagebuf_get_int!(u32, page, dataptr) as usize;
+                let pnum = pagebuf_get_int!(u32, page, dataptr + 4) as u32;
+                let ps = self.rmdb.pagesize;
+                let pages = (dsize + ps - 1) / ps;
+                let data = page_get_many!(self.rmdb, self.mmap, pnum, pages);
+                if integrity_check == true {
+                    let h = pagebuf_get_buf!(page, dataptr + 8, RMDB_INTGSIZE);
+                    self.rmdb.data_integrity_check(&vec![&data[0..dsize]], h)?;
+                }
+                res.push(&data[0..dsize]);
+            }
+            break;
         }
         Ok(res)
     }
 
+    /* FIXME: returns first key only ... until change */
     fn get_leaf_key(&self, leaf: u32) -> Result<&'a [u8], RmdbError> {
         let page = page_get_payload!(self.rmdb, self.mmap, leaf);
         let ptype = pagebuf_get_int!(u16, page, POS_PAGETYPE);
-        if ptype & PAGE_LEAF == PAGE_LEAF {
-            let klen = pagebuf_get_int!(u16, page, LEAF_KEYLEN) as usize;
-            Ok(page_get_buf!(self.rmdb, self.mmap, leaf, LEAF_KEY, klen))
-        } else {
-            Err(RmdbError::PageNotLeaf)
+        if ptype & PAGE_LEAF != PAGE_LEAF {
+            return Err(RmdbError::PageNotLeaf)
         }
+        let keynum = pagebuf_get_int!(u16, page, LEAF_KEYNUM);
+        if keynum != 1 {
+            return Err(RmdbError::InvalidMetadata)
+        }
+        let base = pagebuf_get_int!(u16, page, LEAF_KEYPTRS) as usize;
+        let klen = pagebuf_get_int!(u16, page, base + LEAF_PL_KLEN) as usize;
+        Ok(pagebuf_get_buf!(page, base + LEAF_PL_KEY, (klen & 0x7FFF)))
     }
 
     /* base must be a node page, if 0 is provided we start from rootpage */
@@ -1521,7 +1563,7 @@ impl<'a> RmdbCursor<'a> {
             },
         };
         let key = fetch.get_leaf_key(leafnum)?;
-        let val = fetch.get_data(leafnum, true)?;
+        let val = fetch.get_data(leafnum, key, true)?;
         Ok((key, val))
     }
 
@@ -1560,7 +1602,7 @@ impl RmdbTxn<'_> {
                                    self.rlock.rootpage);
         let leaf = fetch.get_leaf(key)?;
         self.rmdb.integrity_check(&self.rlock.mmap, leaf)?;
-        fetch.get_data(leaf, true)
+        fetch.get_data(leaf, key, true)
     }
 
     fn _scrub(&mut self) {
@@ -1613,7 +1655,7 @@ impl RmdbWTxn<'_> {
         }
         let fetch = RmdbFetch::new(self.rmdb, &self.wlock.mmap, self.rootpage);
         let leaf = fetch.get_leaf(key)?;
-        fetch.get_data(leaf, true)
+        fetch.get_data(leaf, key, true)
     }
 
     pub fn add_entry(&mut self, key: &[u8], value: &[u8])
@@ -1626,83 +1668,67 @@ impl RmdbWTxn<'_> {
 
         /* create new pages */
         let datasize = value.len();
-        let mut dataptr = 0usize;
-        let mut datalen = 0usize;
-        let mut pages = datasize / self.rmdb.pagesize;
-        let overflow = datasize % self.rmdb.pagesize;
-        let overhead = PTRSZ * pages + LEAF_KEY +
-                       align!(u32, key.len()) as usize;
-        if leaf_payload < overhead {
-            return Err(RmdbError::InvalidDataSize);
-        }
-        let avail_space = leaf_payload - overhead;
-        if avail_space < overflow {
-            if avail_space < PTRSZ {
+        let ps = self.rmdb.pagesize;
+        let mut pages = (datasize + ps + 1) / ps;
+        if pages == 1 {
+            /* FIXME: bogus */
+            let overhead = PTRSZ + LEAF_KEYPTRS +
+                           align!(u32, key.len()) as usize;
+            if leaf_payload < overhead {
                 return Err(RmdbError::InvalidDataSize);
             }
-            pages += 1;
-        } else {
-            datalen = overflow;
+            let avail_space = leaf_payload - overhead;
+            if avail_space > datasize {
+                pages = 0;
+            }
         }
-        if datalen > 0 {
-            dataptr = LEAF_KEY + align!(u32, key.len());
-        }
-
-        let pagevec = self.rmdb.get_free_pages(pages + 1, &mut self.wlock, true)?;
 
         /* write leaf page */
+        let pagevec = self.rmdb.get_free_pages(pages + 1, &mut self.wlock, true)?;
         let leaf = pagevec[0];
         self.mark_dirty(leaf, true);
 
-        let mut leafpage = page_get_payload!(mut, self.rmdb, self.wlock.mmap, leaf);
+        let mut page = page_get_payload!(mut, self.rmdb, self.wlock.mmap, leaf);
 
-        pagebuf_set_int!(u16, &mut leafpage, POS_PAGETYPE, PAGE_LEAF);
-        pagebuf_set_int!(u32, &mut leafpage, LEAF_DATASIZE, datasize as u32);
-        pagebuf_set_int!(u16, &mut leafpage, LEAF_DATALEN, datalen as u16);
-        pagebuf_set_int!(u16, &mut leafpage, LEAF_DATAPTR, dataptr as u16);
+        pagebuf_set_int!(u16, &mut page, POS_PAGETYPE, PAGE_LEAF);
+        pagebuf_set_int!(u16, &mut page, LEAF_KEYNUM,  1u16);
 
-        /* add page pointers to leaf pages */
-        let mut pageptr = 0usize;
+        /* todo use a sub slice so we have boundary checks and ptrs */
+        let leafcell = 8usize;
+        let dataptr = align!(u32, leafcell + 2 + key.len());
+
+        /* until we support multiple keys hardcode: */
+        pagebuf_set_int!(u16, &mut page, LEAF_KEYPTRS + 0, leafcell as u16);
+
+        let mut klen = key.len() as u16;
         if pages > 0 {
-            pageptr = leaf_payload - (PTRSZ * pages);
+            klen = klen | 0x8000;
         }
-        pagebuf_set_int!(u16, &mut leafpage, LEAF_PAGEPTR, pageptr as u16);
-
-        for i in 0..pages {
-            pagebuf_set_int!(u32, &mut leafpage,
-                             (pageptr + i * PTRSZ), pagevec[i + 1]);
-        }
-
-        /* copy key */
-        pagebuf_set_int!(u16, &mut leafpage, LEAF_KEYLEN, key.len() as u16);
-        pagebuf_set_buf!(&mut leafpage, LEAF_KEY, key);
+        pagebuf_set_int!(u16, &mut page, leafcell, klen);
+        pagebuf_set_buf!(&mut page, leafcell + LEAF_PL_KEY, key);
 
         /* copy data */
-        //TODO: compute hash as we store data
-        if self.rmdb.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
-            let hash = compute_hash(&vec![value]);
-            pagebuf_set_buf!(&mut leafpage, leaf_payload, &hash);
-        }
+        if pages > 0 {
+            /* drop here to allow following code to manipulate other pages */
+            drop(page);
 
-        /* write overflow data if any */
-        if datalen > 0 {
-            pagebuf_set_buf!(&mut leafpage, dataptr, &value[0..datalen]);
-        }
+            /* get consecutive pages for data */
+            let data = page_get_many!(mut, self.rmdb, self.wlock.mmap,
+                                      pagevec[1], pagevec.len() - 1);
+            data[0..datasize].copy_from_slice(value);
 
-        /* drop here to allow following code to manipulate other pages */
-        drop(leafpage);
+            drop(data);
 
-        /* then write the data */
-        let mut start = datalen;
-        for i in 0..pages {
-            let mut data = page_get_whole!(mut, self.rmdb, self.wlock.mmap,
-                                           pagevec[i + 1]);
-            let mut end = value.len() - start;
-            if end > self.rmdb.pagesize {
-                end = self.rmdb.pagesize;
+            page = page_get_payload!(mut, self.rmdb, self.wlock.mmap, leaf);
+            pagebuf_set_int!(u32, &mut page, dataptr, datasize as u32);
+            pagebuf_set_int!(u32, &mut page, dataptr + 4, pagevec[1]);
+            if self.rmdb.flags.contains(RmdbFlags::PAGE_INTEGRITY) {
+                let hash = compute_hash(&vec![value]);
+                pagebuf_set_buf!(&mut page, dataptr + 8, &hash);
             }
-            pagebuf_set_buf!(&mut data, 0, &value[start..(start + end)]);
-            start += end;
+        } else {
+            pagebuf_set_int!(u16, &mut page, dataptr, value.len() as u16);
+            pagebuf_set_buf!(&mut page, dataptr + 2, value);
         }
 
         /* then add them to the tree */
