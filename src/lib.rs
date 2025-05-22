@@ -79,7 +79,7 @@ const PAGE_DIRTY: u16 = 1u16 << 15;
  * on the size of pages.
  * The number of bits we can store in a freepage map is:
  *  B = (payload - 8) * PTRSZ, where payload is pagesize - integrity (if any)
- * So teh database is spliat in slices of size B * pagesize, and the free
+ * So the database is split in slices of size B * pagesize, and the free
  * page for the area is always located at index * B * pagesize + 1.
  *
  * so for a 4k pagesize DB, B = 32576, and the second freepage is located
