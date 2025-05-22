@@ -542,7 +542,6 @@ impl Rmdb {
         let root = page_get_payload!(mut, self, wlock.mmap, alloc[0]);
         pagebuf_set_int!(u16, root, POS_PAGETYPE, PAGE_NODE | PAGE_ROOT);
         pagebuf_set_int!(u16, root, NODE_NUMPTRS, 0u16);
-        drop(root);
         self.integrity_protect(&mut wlock.mmap, alloc[0])?;
 
         let (fp, fs) = self.set_free_pages_map(0, 0, &mut wlock)?;
@@ -559,7 +558,6 @@ impl Rmdb {
         pagebuf_set_int!(u32, main, RMDB_P_FREESIZE, fs);
         pagebuf_set_int!(u32, main, RMDB_P_ROOT, alloc[0]);
         /* finally integrity protect main */
-        drop(main);
         self.integrity_protect(&mut wlock.mmap, 0)?;
 
         Ok(())
@@ -1004,7 +1002,6 @@ impl Rmdb {
         let main = page_get_payload!(self, wlock.mmap, 0);
         let fpptr = pagebuf_get_int!(u32, main, RMDB_P_FREEPAGES);
         let curpages = pagebuf_get_int!(u32, main, RMDB_P_FREESIZE);
-        drop(main);
         let free = page_get_payload!(self, wlock.mmap, fpptr);
         let cursize = pagebuf_get_int!(u32, free, FREE_MAP_SIZE) as usize;
 
@@ -1709,15 +1706,10 @@ impl RmdbWTxn<'_> {
 
         /* copy data */
         if pages > 0 {
-            /* drop here to allow following code to manipulate other pages */
-            drop(page);
-
             /* get consecutive pages for data */
             let data = page_get_many!(mut, self.rmdb, self.wlock.mmap,
                                       pagevec[1], pagevec.len() - 1);
             data[0..datasize].copy_from_slice(value);
-
-            drop(data);
 
             page = page_get_payload!(mut, self.rmdb, self.wlock.mmap, leaf);
             pagebuf_set_int!(u32, &mut page, dataptr, datasize as u32);
@@ -2210,7 +2202,6 @@ impl RmdbWTxn<'_> {
         let main = page_get_payload!(self.rmdb, self.wlock.mmap, 0);
         let fp = pagebuf_get_int!(u32, main, RMDB_P_FREEPAGES);
         let fs = pagebuf_get_int!(u32, main, RMDB_P_FREESIZE);
-        drop(main);
 
         /* write the freepages back to the file */
         let (fp, fs) = self.rmdb.set_free_pages_map(fp, fs, &mut *self.wlock)?;
